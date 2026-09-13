@@ -11,7 +11,6 @@ from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 from utils.browser_utils import filter_cookies, take_screenshot, save_page_content_to_file
 from utils.config import ProviderConfig
 from utils.get_headers import get_browser_headers, print_browser_headers
-from utils.proxy_bridge import get_browser_proxy
 from utils.storage_state import ensure_storage_state_from_env
 
 STORAGE_STATE_ENV_NAME = "STORATE_STATES_LINUXDO"
@@ -68,9 +67,7 @@ class LinuxDoSignIn:
         )
 
         # 使用 Camoufox 启动浏览器（LINUXDO_PROXY 启用时通过代理访问 linux.do）
-        # 浏览器（Camoufox/Playwright）不支持带认证的 SOCKS5，自动经本地桥接转换为 HTTP 代理
-        browser_proxy = get_browser_proxy(self.proxy, self.account_name)
-        print(f"ℹ️ {self.account_name}: 正在访问 linux.do（使用代理: {'true' if browser_proxy else 'false'}）")
+        print(f"ℹ️ {self.account_name}: 正在访问 linux.do（使用代理: {'true' if self.proxy else 'false'}）")
         async with AsyncCamoufox(
             # persistent_context=True,
             # user_data_dir=tmp_dir,
@@ -78,8 +75,8 @@ class LinuxDoSignIn:
             humanize=True,
             locale="en-US",
             os="macos",  # 强制使用 macOS 指纹，避免跨平台指纹不一致问题
-            geoip=True if browser_proxy else False,
-            proxy=browser_proxy,
+            geoip=True if self.proxy else False,
+            proxy=self.proxy,
             config={
                 "forceScopeAccess": True,
             },
