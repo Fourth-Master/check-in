@@ -11,7 +11,6 @@ import tempfile
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 from utils.get_headers import get_browser_headers, print_browser_headers
-from utils.proxy_bridge import get_browser_proxy
 
 async def get_cf_clearance(
     url: str,
@@ -42,12 +41,9 @@ async def get_cf_clearance(
     
     safe_account_name = "".join(c if c.isalnum() else "_" for c in account_name)
 
-    # 浏览器（Camoufox/Playwright）不支持带认证的 SOCKS5，自动经本地桥接转换为 HTTP 代理
-    browser_proxy = get_browser_proxy(proxy_config, account_name)
-
     print(
         f"ℹ️ {account_name}: 启动浏览器获取 cf_clearance，目标: {url} "
-        f"(使用代理: {'true' if browser_proxy else 'false'})"
+        f"(使用代理: {'true' if proxy_config else 'false'})"
     )
 
     with tempfile.TemporaryDirectory(prefix=f"camoufox_{safe_account_name}_cf_clearance_") as tmp_dir:
@@ -59,8 +55,8 @@ async def get_cf_clearance(
             headless=False,
             humanize=True,
             locale="en-US",
-            geoip=True if browser_proxy else False,
-            proxy=browser_proxy,
+            geoip=True if proxy_config else False,
+            proxy=proxy_config,
             os="macos",
             config={
                 "forceScopeAccess": True,
