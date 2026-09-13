@@ -103,13 +103,28 @@ jobs:
         restore-keys: |
           balance-hash-
             
+    - name: 启动 v2ray 本地代理
+      if: ${{ secrets.V2RAY_SUBSCRIPTION != '' }}
+      id: v2ray
+      continue-on-error: true
+      env:
+        V2RAY_SUBSCRIPTION: ${{ secrets.V2RAY_SUBSCRIPTION }}
+        V2RAY_NODE_FILTER: ${{ secrets.V2RAY_NODE_FILTER }}
+      run: |
+        $xrayDir = "$env:RUNNER_TEMP\xray"
+        New-Item -ItemType Directory -Force -Path $xrayDir | Out-Null
+        Invoke-WebRequest -Uri "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip" -OutFile "$xrayDir\xray.zip"
+        Expand-Archive -Path "$xrayDir\xray.zip" -DestinationPath $xrayDir -Force
+        $env:XRAY_PATH = "$xrayDir\xray.exe"
+        uv run python -u v2ray_proxy.py
+
     - name: 执行签到
       env:
         ACCOUNTS: ${{ inputs.accounts || secrets.ACCOUNTS }}
         ACCOUNTS_LINUX_DO: ${{ secrets.ACCOUNTS_LINUX_DO }}
         ACCOUNTS_GITHUB: ${{ secrets.ACCOUNTS_GITHUB }}
         PROVIDERS: ${{ inputs.providers || secrets.PROVIDERS || vars.PROVIDERS }}
-        PROXY: ${{secrets.PROXY}}
+        PROXY: ${{ steps.v2ray.outputs.proxy || secrets.PROXY }}
         LINUXDO_PROXY: ${{ secrets.LINUXDO_PROXY || vars.LINUXDO_PROXY || 'false' }}
         STORATE_STATES_GITHUB: ${{ secrets.STORATE_STATES_GITHUB }}
         STORATE_STATES_LINUXDO: ${{ secrets.STORATE_STATES_LINUXDO }}
