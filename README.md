@@ -238,13 +238,11 @@
   "password": "password"
 }
 
-也支持 socks5 代理，带用户名密码认证也可以直接使用（无需手动转换）：
-- HTTP 请求层（签到接口、OAuth 回调等）：直接使用 SOCKS5 认证
-- 浏览器层（Camoufox 不支持 SOCKS5 认证）：脚本自动在本地启动一个 HTTP→SOCKS5 桥接代理
-  （监听 127.0.0.1 随机端口、无认证），浏览器流量经桥接转发到远端 SOCKS5，等效于直接使用带认证的 SOCKS5
+也支持 socks5 代理，但注意：浏览器端（Camoufox）不支持 socks5 的用户名密码认证（HTTP 请求层支持）。
+带认证的节点建议直接使用 **v2ray 订阅代理**（见 3.5.3，本地代理无认证、浏览器可用），或使用 http 代理入口：
 
 {
-  "server": "socks5://username:password@proxy.example.com:1080"
+  "server": "socks5://proxy.example.com:1080"
 }
 ```
 
