@@ -267,6 +267,23 @@ linux.do 会对 GitHub Actions 等数据中心 IP 进行限流（登录页返回
 - `LINUXDO_PROXY=true` 时，登录/授权 linux.do（`https://linux.do/`、`https://connect.linux.do/`）的浏览器流量使用 `PROXY` secret 中配置的代理
 - 未配置或为 `false` 时，访问 linux.do 与站点访问使用相同的代理策略（账号 `proxy` 字段控制）
 
+#### 3.5.2 预置 linux.do 会话（STORATE_STATES_LINUXDO，推荐）
+
+linux.do 的 Cloudflare 防护会对数据中心 IP（包括常见代理出口）弹出人机验证，自动登录可能被拦截。
+预置一个有效的 linux.do 会话后，脚本将跳过登录页直接授权，从根本上绕开该问题：
+
+在 Settings -> Environments -> production -> Environment secrets 中添加：
+   - Name: `STORATE_STATES_LINUXDO`
+   - Value: `{"你的linux.do用户名": { ...storage state JSON... }}`
+
+获取方式（任选其一）：
+1. 本地运行一次本脚本（环境变量 `RUN_LINUXDO_LOGIN_MANUAL=true`），登录成功后取
+   `storage-states/linuxdo_xxxxxxxx_storage_state.json` 文件的完整 JSON 内容；
+2. 用浏览器插件（如 Cookie-Editor）导出 linux.do 的会话 Cookie，
+   组装为 Playwright storage state 格式：`{"cookies": [...], "origins": []}`。
+
+注意：会话有效期有限，过期后（日志提示缓存会话失效）需重新生成。
+
 
 #### 3.6 如何获取 cookies 与 api_user 的值。
 
