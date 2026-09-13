@@ -25,7 +25,6 @@ from utils.browser_utils import take_screenshot, save_page_content_to_file
 from utils.http_utils import proxy_resolve, response_resolve, resolve_account_proxy
 from utils.get_headers import get_curl_cffi_impersonate
 from utils.get_cf_clearance import get_cf_clearance
-from utils.proxy_bridge import get_browser_proxy
 
 if TYPE_CHECKING:
     from utils.config import AccountConfig
@@ -287,9 +286,7 @@ async def _get_x666_user_token(
         if proxy_config:
             http_proxy = proxy_resolve(proxy_config)
             if http_proxy:
-                # 浏览器（Camoufox/Playwright）不支持带认证的 SOCKS5，自动经本地桥接转换为 HTTP 代理
-                browser_proxy = get_browser_proxy(proxy_config, account_name)
-                proxy_args["proxy"] = browser_proxy if browser_proxy else {"server": http_proxy}
+                proxy_args["proxy"] = {"server": http_proxy}
 
         async with AsyncCamoufox(
             headless=False,
