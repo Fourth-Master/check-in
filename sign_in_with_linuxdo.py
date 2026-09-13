@@ -185,11 +185,85 @@ class LinuxDoSignIn:
                                 except Exception as solve_err:
                                     print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
 
+                            # 等待登录表单可见（新登录页为 Ember 异步水合，需等表单交互就绪）
+                            try:
+                                await page.wait_for_selector("#login-button", state="visible", timeout=15000)
+                            except Exception:
+                                print(f"⚠️ {self.account_name}: 等待登录按钮超时，继续尝试")
+
+                            # 监听登录接口响应，用于诊断登录失败的具体原因
+                            login_api_responses = []
+
+                            def _capture_login_response(response):
+                                try:
+                                    if "/session" in response.url and response.request.method == "POST":
+                                        login_api_responses.append(response)
+                                except Exception:
+                                    pass
+
+                            page.on("response", _capture_login_response)
+
                             await page.fill("#login-account-name", self.username)
                             await page.wait_for_timeout(2000)
                             await page.fill("#login-account-password", self.password)
                             await page.wait_for_timeout(2000)
+
+                            # 页面异步水合可能重置已填写的表单，点击前校验一次
+                            for _selector, _value in (
+                                ("#login-account-name", self.username),
+                                ("#login-account-password", self.password),
+                            ):
+                                try:
+                                    if (await page.input_value(_selector)) != _value:
+                                        print(f"⚠️ {self.account_name}: 表单字段被页面重置，重新填写 {_selector}")
+                                        await page.fill(_selector, _value)
+                                except Exception:
+                                    pass
+
+                            # 新登录页提交需要 Cloudflare Turnstile 令牌，网络慢时其脚本加载较久，
+                            # 必须等令牌就绪再点击登录，否则提交会被静默拦截
+                            try:
+                                await page.wait_for_function(
+                                    """() => {
+                                        const el = document.querySelector('input[name="cf-turnstile-response"]');
+                                        return el && el.value && el.value.length > 10;
+                                    }""",
+                                    timeout=30000,
+                                )
+                                print(f"ℹ️ {self.account_name}: Turnstile 令牌已就绪")
+                            except Exception:
+                                print(f"⚠️ {self.account_name}: 等待 Turnstile 令牌超时，继续尝试提交")
+
                             await page.click("#login-button")
+
+                            # 等待登录结果：跳转离开 /login，或登录接口返回响应
+                            for _ in range(30):
+                                if "/login" not in page.url or login_api_responses:
+                                    break
+                                await page.wait_for_timeout(1000)
+
+                            for _resp in login_api_responses:
+                                try:
+                                    _body = await _resp.json()
+                                    _msg = _body.get("message") or _body.get("error") or ""
+                                    _ok = _body.get("success") or _body.get("ret") == 1
+                                    if _resp.status == 200 and _ok:
+                                        print(f"✅ {self.account_name}: 登录接口返回成功 ({_resp.status})")
+                                    else:
+                                        try:
+                                            detail = _msg or (await _resp.text())[:200]
+                                        except Exception:
+                                            detail = _msg
+                                        print(
+                                            f"❌ {self.account_name}: 登录接口返回失败 "
+                                            f"HTTP {_resp.status}：{detail}"
+                                        )
+                                except Exception:
+                                    print(f"⚠️ {self.account_name}: 登录接口响应无法解析 (HTTP {_resp.status})")
+                            if not login_api_responses:
+                                print(f"⚠️ {self.account_name}: 未捕获到登录接口请求，页面 URL: {page.url}")
+                            page.remove_listener("response", _capture_login_response)
+
                             await page.wait_for_timeout(10000)
 
                             await save_page_content_to_file(page, "sign_in_result", self.account_name, prefix="linuxdo")
