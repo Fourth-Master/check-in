@@ -314,8 +314,9 @@ def _warn_socks5_auth(proxy: Dict) -> None:
     has_auth = "@" in server or (proxy.get("username") and proxy.get("password"))
     if has_auth:
         print(
-            "ℹ️ 检测到带用户名密码认证的 SOCKS5 代理：HTTP 请求将直接使用；"
-            "浏览器流量将自动经本地桥接 HTTP 代理转发（Camoufox 不支持 SOCKS5 认证）"
+            "⚠️ Camoufox（Firefox 内核）不支持带用户名密码认证的 SOCKS5 代理，"
+            "浏览器流程会启动失败。带认证请改用 HTTP 代理，或使用 v2ray 订阅代理"
+            "（本地代理无认证，见 README 3.5.3）"
         )
 
 
