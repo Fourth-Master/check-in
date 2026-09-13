@@ -284,6 +284,23 @@ linux.do 的 Cloudflare 防护会对数据中心 IP（包括常见代理出口�
 
 注意：会话有效期有限，过期后（日志提示缓存会话失效）需重新生成。
 
+#### 3.5.3 v2ray 订阅代理（V2RAY_SUBSCRIPTION，可选）
+
+直接使用 v2ray 订阅地址：运行时自动下载订阅、解析节点、随机挑选并实测连通性，
+启动本地 xray-core（仅监听 127.0.0.1:10808 socks5 / 10809 http，无认证），
+签到流量走所选节点出口。本地代理无认证，浏览器可直接使用。
+
+在 Settings -> Environments -> production -> Environment secrets 中添加：
+   - Name: `V2RAY_SUBSCRIPTION`
+   - Value: v2ray 订阅地址
+   可选：Name: `V2RAY_NODE_FILTER`，Value: 节点名称过滤（正则，如 `香港|HK|日本|JP`）
+
+- 启用后 `PROXY` 自动指向本地代理（无需再配置 `PROXY` secret）；仍需 `LINUXDO_PROXY=true`
+  让 linux.do 流量走代理，或账号设置 `"proxy": true`
+- 每次运行随机选择节点，最多尝试 5 个，全部实测连通后才使用；日志会打印所选节点与出口 IP
+- 支持 vmess / vless / trojan / shadowsocks 节点（tcp/ws/grpc/h2、tls/reality）
+- 仅支持在 GitHub Actions 中使用（本地运行需自行安装 xray 并设置 `XRAY_PATH`）
+
 
 #### 3.6 如何获取 cookies 与 api_user 的值。
 
