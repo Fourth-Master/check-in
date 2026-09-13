@@ -170,20 +170,38 @@ class LinuxDoSignIn:
 
                             await page.goto("https://linux.do/login", wait_until="domcontentloaded")
 
-                            # 检查是否在 Cloudflare 验证页面
-                            page_title = await page.title()
-                            page_content = await page.content()
+                            # Cloudflare 质询页处理：质询脚本经代理可能加载缓慢或失败，
+                            # 自动解决 + 等待 + 刷新最多重试 2 轮
+                            for _cf_attempt in (1, 2):
+                                page_title = await page.title()
+                                page_content = await page.content()
 
-                            if "Just a moment" in page_title or "Checking your browser" in page_content:
-                                print(f"ℹ️ {self.account_name}: 检测到 Cloudflare 验证，正在自动解决...")
+                                if "Just a moment" not in page_title and "Checking your browser" not in page_content:
+                                    break
+
+                                print(
+                                    f"ℹ️ {self.account_name}: 检测到 Cloudflare 验证，"
+                                    f"正在自动解决（第 {_cf_attempt}/2 轮）..."
+                                )
                                 try:
                                     await solver.solve_captcha(
                                         captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
                                     )
                                     print(f"✅ {self.account_name}: Cloudflare 验证已自动解决")
-                                    await page.wait_for_timeout(10000)
                                 except Exception as solve_err:
                                     print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
+
+                                # 等待质询页消失（登录表单出现），最多 45 秒
+                                try:
+                                    await page.wait_for_selector("#login-button", state="visible", timeout=45000)
+                                    break
+                                except Exception:
+                                    if _cf_attempt == 1:
+                                        print(f"ℹ️ {self.account_name}: 质询未通过，刷新页面重试")
+                                        try:
+                                            await page.reload(wait_until="domcontentloaded")
+                                        except Exception:
+                                            pass
 
                             # 等待登录表单可见（新登录页为 Ember 异步水合，需等表单交互就绪）
                             try:
