@@ -24,11 +24,25 @@ from urllib.parse import unquote
 
 # SOCKS5 握手常量
 _SOCKS_VER = 0x05
+_CMD_CONNECT = 0x01
 _METHOD_NO_AUTH = 0x00
 _METHOD_USER_PASS = 0x02
 _ATYP_IPV4 = 0x01
 _ATYP_DOMAIN = 0x03
 _ATYP_IPV6 = 0x04
+
+# RFC 1928 reply code 说明，用于错误日志
+_SOCKS_REPLY_MESSAGES = {
+    0: "成功",
+    1: "通用 SOCKS 服务器失败",
+    2: "规则不允许此连接",
+    3: "网络不可达",
+    4: "主机不可达",
+    5: "连接被拒绝",
+    6: "TTL 过期",
+    7: "命令不支持",
+    8: "地址类型不支持",
+}
 
 _CONNECT_OK = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _CONNECT_FAIL = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -259,12 +273,14 @@ class Socks5HttpBridge:
             else:
                 encoded = _encode_host(host)
                 addr = bytes([_ATYP_DOMAIN, len(encoded)]) + encoded
-            remote.sendall(bytes([_SOCKS_VER, 0x00, 0x00]) + addr + struct.pack(">H", port or 80))
+            # CONNECT 命令：VER=5, CMD=1(CONNECT), RSV=0
+            remote.sendall(bytes([_SOCKS_VER, _CMD_CONNECT, 0x00]) + addr + struct.pack(">H", port or 80))
 
             reply = self._recv_exact(remote, 4)
             if not reply or reply[1] != 0x00:
                 code = reply[1] if reply else -1
-                self._log_error(f"SOCKS5 CONNECT 失败: {host}:{port} (reply={code})")
+                reason = _SOCKS_REPLY_MESSAGES.get(code, "未知错误码")
+                self._log_error(f"SOCKS5 CONNECT 失败: {host}:{port} (reply={code}, {reason})")
                 remote.close()
                 return None
 
