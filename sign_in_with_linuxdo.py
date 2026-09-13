@@ -240,23 +240,6 @@ class LinuxDoSignIn:
                                 except Exception:
                                     pass
 
-                            # 新登录页提交需要 Cloudflare Turnstile 令牌，网络慢时其脚本加载较久，
-                            # 必须等令牌就绪再点击登录，否则提交会被静默拦截
-                            try:
-                                await page.wait_for_function(
-                                    """() => {
-                                        const el = document.querySelector('input[name="cf-turnstile-response"]');
-                                        return el && el.value && el.value.length > 10;
-                                    }""",
-                                    timeout=30000,
-                                )
-                                print(f"ℹ️ {self.account_name}: Turnstile 令牌已就绪")
-                            except Exception:
-                                print(f"⚠️ {self.account_name}: 等待 Turnstile 令牌超时，继续尝试提交")
-
-                            # 提交方式 1：点击页面 CTA 登录按钮
-                            await page.click("#login-button")
-
                             # 等待登录结果：跳转离开 /login，或登录接口返回响应
                             async def _wait_login_result(seconds: int) -> bool:
                                 for _ in range(seconds):
@@ -264,6 +247,37 @@ class LinuxDoSignIn:
                                         return True
                                     await page.wait_for_timeout(1000)
                                 return bool(login_api_responses) or "/login" not in page.url
+
+                            async def _wait_turnstile_token(timeout_ms: int) -> bool:
+                                """等待 Cloudflare Turnstile 令牌存在（新登录页提交必需）"""
+                                try:
+                                    await page.wait_for_function(
+                                        """() => {
+                                            const el = document.querySelector('input[name="cf-turnstile-response"]');
+                                            return el && el.value && el.value.length > 10;
+                                        }""",
+                                        timeout=timeout_ms,
+                                    )
+                                    return True
+                                except Exception:
+                                    return False
+
+                            if await _wait_turnstile_token(30000):
+                                print(f"ℹ️ {self.account_name}: Turnstile 令牌已就绪")
+                            else:
+                                print(f"⚠️ {self.account_name}: 等待 Turnstile 令牌超时，继续尝试提交")
+
+                            # 提交方式 1：点击页面 CTA 登录按钮，最多 3 轮。
+                            # 令牌经代理刷新失败时（challenges.cloudflare.com 不可达），客户端会
+                            # 静默拦截提交且无任何报错；令牌组件恢复后会重新生成令牌，重试即可
+                            for _click_round in (1, 2, 3):
+                                await _wait_turnstile_token(20000)
+                                await page.click("#login-button")
+                                print(f"ℹ️ {self.account_name}: 已点击登录按钮（第 {_click_round}/3 轮）")
+                                if await _wait_login_result(12):
+                                    break
+                                if _click_round < 3:
+                                    print(f"⚠️ {self.account_name}: 点击后无登录请求，等待令牌恢复后重试")
 
                             if not await _wait_login_result(15):
                                 # 提交方式 2：密码框内回车提交
