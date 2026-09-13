@@ -191,12 +191,14 @@ class LinuxDoSignIn:
                             except Exception:
                                 print(f"⚠️ {self.account_name}: 等待登录按钮超时，继续尝试")
 
-                            # 监听登录接口响应，用于诊断登录失败的具体原因
+                            # 监听登录相关响应（/session 为 Ember XHR，POST /login 为免 JS 原生表单提交）
                             login_api_responses = []
 
                             def _capture_login_response(response):
                                 try:
-                                    if "/session" in response.url and response.request.method == "POST":
+                                    if response.request.method == "POST" and (
+                                        "/session" in response.url or response.url.rstrip("/").endswith("/login")
+                                    ):
                                         login_api_responses.append(response)
                                 except Exception:
                                     pass
@@ -234,34 +236,74 @@ class LinuxDoSignIn:
                             except Exception:
                                 print(f"⚠️ {self.account_name}: 等待 Turnstile 令牌超时，继续尝试提交")
 
+                            # 提交方式 1：点击页面 CTA 登录按钮
                             await page.click("#login-button")
 
                             # 等待登录结果：跳转离开 /login，或登录接口返回响应
-                            for _ in range(30):
-                                if "/login" not in page.url or login_api_responses:
-                                    break
-                                await page.wait_for_timeout(1000)
+                            async def _wait_login_result(seconds: int) -> bool:
+                                for _ in range(seconds):
+                                    if "/login" not in page.url or login_api_responses:
+                                        return True
+                                    await page.wait_for_timeout(1000)
+                                return bool(login_api_responses) or "/login" not in page.url
+
+                            if not await _wait_login_result(15):
+                                # 提交方式 2：密码框内回车提交
+                                print(f"⚠️ {self.account_name}: 点击登录按钮无响应，尝试回车提交")
+                                try:
+                                    await page.press("#login-account-password", "Enter")
+                                except Exception:
+                                    pass
+                                await _wait_login_result(10)
+
+                            if not login_api_responses and "/login" in page.url:
+                                # 提交方式 3：使用页面自带的免 JS 原生表单（hidden-login-form）直接提交
+                                print(f"⚠️ {self.account_name}: 回车提交也无响应，尝试原生表单提交")
+                                try:
+                                    await page.evaluate(
+                                        """(creds) => {
+                                            const f = document.querySelector('#hidden-login-form');
+                                            if (!f) return false;
+                                            const u = f.querySelector('#signin_username');
+                                            const p = f.querySelector('#signin_password');
+                                            if (!u || !p) return false;
+                                            u.value = creds.u;
+                                            p.value = creds.p;
+                                            const btn = f.querySelector('#signin-button');
+                                            if (btn) btn.click();
+                                            return true;
+                                        }""",
+                                        {"u": self.username, "p": self.password},
+                                    )
+                                except Exception as eval_err:
+                                    print(f"⚠️ {self.account_name}: 原生表单提交失败: {eval_err}")
+                                await _wait_login_result(15)
 
                             for _resp in login_api_responses:
                                 try:
-                                    _body = await _resp.json()
-                                    _msg = _body.get("message") or _body.get("error") or ""
-                                    _ok = _body.get("success") or _body.get("ret") == 1
-                                    if _resp.status == 200 and _ok:
-                                        print(f"✅ {self.account_name}: 登录接口返回成功 ({_resp.status})")
-                                    else:
+                                    _status = _resp.status
+                                    _detail = ""
+                                    try:
+                                        _body = await _resp.json()
+                                        _detail = _body.get("message") or _body.get("error") or ""
+                                    except Exception:
                                         try:
-                                            detail = _msg or (await _resp.text())[:200]
+                                            _detail = (await _resp.text())[:120]
                                         except Exception:
-                                            detail = _msg
+                                            _detail = ""
+                                    if _status == 200 and "/session" in _resp.url:
+                                        print(f"ℹ️ {self.account_name}: 登录接口响应 HTTP 200：{_detail or '(无消息体)'}")
+                                    else:
                                         print(
-                                            f"❌ {self.account_name}: 登录接口返回失败 "
-                                            f"HTTP {_resp.status}：{detail}"
+                                            f"⚠️ {self.account_name}: 登录请求响应 HTTP {_status}：{_detail}"
                                         )
                                 except Exception:
-                                    print(f"⚠️ {self.account_name}: 登录接口响应无法解析 (HTTP {_resp.status})")
+                                    print(f"⚠️ {self.account_name}: 登录请求响应无法解析")
                             if not login_api_responses:
-                                print(f"⚠️ {self.account_name}: 未捕获到登录接口请求，页面 URL: {page.url}")
+                                print(
+                                    f"⚠️ {self.account_name}: 未捕获到任何登录请求，页面 URL: {page.url}，"
+                                    "页面脚本可能未完全加载"
+                                )
                             page.remove_listener("response", _capture_login_response)
 
                             await page.wait_for_timeout(10000)
