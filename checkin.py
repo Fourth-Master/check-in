@@ -17,7 +17,6 @@ from utils.config import AccountConfig, ProviderConfig
 from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.get_cf_clearance import get_cf_clearance
 from utils.http_utils import proxy_resolve, response_resolve, resolve_account_proxy
-from utils.proxy_bridge import get_browser_proxy, stop_all_bridges
 from utils.topup import topup
 from utils.get_headers import get_browser_headers, get_curl_cffi_impersonate, print_browser_headers
 from utils.mask_utils import mask_username
@@ -57,10 +56,10 @@ class CheckIn:
                 f"ℹ️ {self.account_name}: 已配置全局 PROXY 但此账号未启用 "
                 "(在 ACCOUNTS 中设置 \"proxy\": true 以启用)"
             )
-        # HTTP 请求层（curl_cffi/libcurl）原生支持带认证的 SOCKS5，直接使用
+        # HTTP 请求层（curl_cffi/libcurl）与浏览器层共用账号代理配置
+        # （本地代理如 v2ray/xray 均为无认证 socks5/http，浏览器可直接使用）
         self.http_proxy_config = proxy_resolve(resolved_proxy)
-        # 浏览器层（Camoufox/Playwright）不支持 socks5 认证，带认证的 socks5 自动经本地桥接转换
-        self.camoufox_proxy_config = get_browser_proxy(resolved_proxy, self.account_name)
+        self.camoufox_proxy_config = resolved_proxy
 
         # storage-states 目录
         self.storage_state_dir = storage_state_dir
