@@ -158,13 +158,38 @@ class LinuxDoSignIn:
                                 print(
                                     f"✅ {self.account_name}: 会话有效（SSO 跳转中），继续等待授权页面"
                                 )
-                                try:
-                                    await page.wait_for_selector(
-                                        'a[href^="/oauth2/approve"], input[type="submit"]',
-                                        timeout=20000,
-                                    )
-                                except Exception:
-                                    pass
+                                # SSO 链路（connect.linux.do）可能再次弹出 Cloudflare 质询
+                                # （预置会话的 cf_clearance 与当前代理出口 IP 不匹配），
+                                # 先自动解决质询再等授权按钮
+                                for _sso_wait_round in range(3):
+                                    try:
+                                        _title = await page.title()
+                                        if "Just a moment" in _title or "Checking your browser" in (await page.content()):
+                                            print(
+                                                f"ℹ️ {self.account_name}: SSO 跳转遇到 Cloudflare 质询，"
+                                                f"正在自动解决（第 {_sso_wait_round + 1}/3 轮）..."
+                                            )
+                                            try:
+                                                await solver.solve_captcha(
+                                                    captcha_container=page,
+                                                    captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL,
+                                                )
+                                                print(f"✅ {self.account_name}: Cloudflare 质询已自动解决")
+                                            except Exception as solve_err:
+                                                print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
+                                        await page.wait_for_selector(
+                                            'a[href^="/oauth2/approve"], input[type="submit"]',
+                                            timeout=20000,
+                                        )
+                                        break
+                                    except Exception:
+                                        if _sso_wait_round == 2:
+                                            print(
+                                                f"⚠️ {self.account_name}: 等待授权页面超时，"
+                                                f"当前页面: {page.url}"
+                                            )
+                                        else:
+                                            await page.wait_for_timeout(3000)
                             else:
                                 # 检查是否出现授权按钮（表示已登录）
                                 allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
