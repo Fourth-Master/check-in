@@ -104,13 +104,16 @@ jobs:
           balance-hash-
             
     - name: 启动 v2ray 本地代理
-      if: ${{ secrets.V2RAY_SUBSCRIPTION != '' }}
       id: v2ray
       continue-on-error: true
       env:
         V2RAY_SUBSCRIPTION: ${{ secrets.V2RAY_SUBSCRIPTION }}
         V2RAY_NODE_FILTER: ${{ secrets.V2RAY_NODE_FILTER }}
       run: |
+        if (-not $env:V2RAY_SUBSCRIPTION) {
+          echo "V2RAY_SUBSCRIPTION 未配置，跳过 v2ray 代理"
+          exit 0
+        }
         $xrayDir = "$env:RUNNER_TEMP\xray"
         New-Item -ItemType Directory -Force -Path $xrayDir | Out-Null
         Invoke-WebRequest -Uri "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip" -OutFile "$xrayDir\xray.zip"
