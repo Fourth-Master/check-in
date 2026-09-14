@@ -66,6 +66,23 @@ class CheckIn:
 
         os.makedirs(self.storage_state_dir, exist_ok=True)
 
+    # WAF cookie 与来源 IP 绑定：签到请求与获取 bypass_cookies 走同一出口（默认直连），
+    # 而 OAuth 浏览器可能经代理（出口 IP 不同）回跳站点拿到另一组 WAF cookie。
+    # 合并时 WAF 类 cookie 必须保留 bypass 侧的版本，否则签到请求会被 WAF 拦截
+    WAF_COOKIE_NAMES = frozenset({"acw_tc", "cdn_sec_tc", "acw_sc__v2", "cf_clearance"})
+
+    def merge_cookies(self, bypass_cookies: dict, user_cookies: dict) -> dict:
+        """合并 WAF/CF bypass cookies 与用户会话 cookies
+
+        WAF 类 cookie 优先取 bypass_cookies（与签到请求同出口），
+        其余（session 等站点会话）优先取 user_cookies
+        """
+        merged = dict(user_cookies)
+        for name, value in bypass_cookies.items():
+            if name in self.WAF_COOKIE_NAMES or name not in merged:
+                merged[name] = value
+        return merged
+
     async def get_waf_cookies_with_browser(self) -> dict | None:
         """使用 Camoufox 获取 WAF cookies（隐私模式）"""
         print(
@@ -1254,7 +1271,7 @@ class CheckIn:
                     print(f"ℹ️ {self.account_name}: 使用 OAuth 浏览器指纹更新 headers")
                     updated_headers.update(oauth_browser_headers)
 
-                merged_cookies = {**bypass_cookies, **user_cookies}
+                merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
                 return await self.check_in_with_cookies(merged_cookies, updated_headers, api_user, impersonate)
             elif success and "code" in result_data and "state" in result_data:
                 # 收到 OAuth code，通过 HTTP 调用回调接口获取 api_user
@@ -1295,7 +1312,7 @@ class CheckIn:
                                 print(
                                     f"ℹ️ {self.account_name}: 提取到 {len(user_cookies)} 个用户 Cookie: {list(user_cookies.keys())}"
                                 )
-                                merged_cookies = {**bypass_cookies, **user_cookies}
+                                merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
                                 return await self.check_in_with_cookies(merged_cookies, updated_headers, api_user, impersonate)
                             else:
                                 print(f"❌ {self.account_name}: 回调响应中没有用户 ID")
@@ -1439,7 +1456,7 @@ class CheckIn:
                     print(f"ℹ️ {self.account_name}: 使用 OAuth 浏览器指纹更新 headers")
                     updated_headers.update(oauth_browser_headers)
 
-                merged_cookies = {**bypass_cookies, **user_cookies}
+                merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
                 return await self.check_in_with_cookies(merged_cookies, updated_headers, api_user, impersonate)
             elif success and "code" in result_data and "state" in result_data:
                 # 收到 OAuth code，通过 HTTP 调用回调接口获取 api_user
@@ -1480,7 +1497,7 @@ class CheckIn:
                                 print(
                                     f"ℹ️ {self.account_name}: 提取到 {len(user_cookies)} 个用户 Cookie: {list(user_cookies.keys())}"
                                 )
-                                merged_cookies = {**bypass_cookies, **user_cookies}
+                                merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
                                 return await self.check_in_with_cookies(merged_cookies, updated_headers, api_user, impersonate)
                             else:
                                 print(f"❌ {self.account_name}: 回调响应中没有用户 ID")
@@ -1586,7 +1603,7 @@ class CheckIn:
 
             print(f"ℹ️ {self.account_name}: 提取到 {len(user_cookies)} 个站点登录 Cookie: {list(user_cookies.keys())}")
 
-            merged_cookies = {**bypass_cookies, **user_cookies}
+            merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
             return await self.check_in_with_cookies(merged_cookies, common_headers, api_user, impersonate)
 
         except Exception as e:
@@ -1847,7 +1864,7 @@ class CheckIn:
 
                 restore_cookies = await context.cookies()
                 user_cookies = filter_cookies(restore_cookies, self.provider_config.origin)
-                merged_cookies = {**bypass_cookies, **user_cookies}
+                merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
 
                 api_user = await self._read_site_api_user_from_browser(page, merged_cookies, common_headers)
                 if api_user is None:
