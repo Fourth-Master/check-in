@@ -248,9 +248,21 @@ class GitHubSignIn:
                             except Exception as e:
                                 print(f"⚠️ {self.account_name}: 处理两步验证时出错: {e}")
 
-                            # 保存新的会话状态
-                            await context.storage_state(path=cache_file_path)
-                            print(f"✅ {self.account_name}: 会话缓存已保存到缓存文件")
+                            # 仅在确认登录成功（存在 user_session cookie）时保存会话，
+                            # 2FA 未通过时保存的"半登录"状态会污染缓存，导致后续每次都要重新登录
+                            try:
+                                _cookies = await context.cookies()
+                                _has_session = any(c["name"] == "user_session" for c in _cookies)
+                            except Exception:
+                                _has_session = False
+                            if _has_session:
+                                await context.storage_state(path=cache_file_path)
+                                print(f"✅ {self.account_name}: 会话缓存已保存到缓存文件")
+                            else:
+                                print(
+                                    f"⚠️ {self.account_name}: 未检测到 GitHub 登录态（user_session 缺失，"
+                                    "2FA 可能未通过），跳过保存以避免污染缓存"
+                                )
 
                         except Exception as e:
                             print(f"❌ {self.account_name}: 登录 GitHub 时发生错误: {e}")
