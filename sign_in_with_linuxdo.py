@@ -165,7 +165,17 @@ class LinuxDoSignIn:
                         try:
                             print(f"ℹ️ {self.account_name}: 开始登录 linux.do")
 
-                            await page.goto("https://linux.do/login", wait_until="domcontentloaded")
+                            try:
+                                await page.goto(
+                                    "https://linux.do/login",
+                                    wait_until="domcontentloaded",
+                                    timeout=90000,
+                                )
+                            except Exception as goto_err:
+                                print(
+                                    f"⚠️ {self.account_name}: 登录页加载缓慢或失败（{type(goto_err).__name__}），"
+                                    "代理出口可能不稳定"
+                                )
 
                             # Cloudflare 质询页处理：质询脚本经代理可能加载缓慢或失败，
                             # 自动解决 + 等待 + 刷新最多重试 2 轮
