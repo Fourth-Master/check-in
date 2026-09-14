@@ -73,33 +73,45 @@ class LinuxDoSignIn:
         try:
             await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=90000)
 
-            # 等 GitHub 按钮出现并点击（页面异步水合）
+            async def _safe_query(selector: str):
+                """跳转进行中时 query_selector 会抛 Execution context destroyed，容忍之"""
+                try:
+                    return await page.query_selector(selector)
+                except Exception:
+                    return None
+
+            # 等 GitHub 按钮出现并点击（页面异步水合；点击会触发跳转，期间 DOM 查询可能失败）
             github_btn = None
             for _ in range(5):
-                github_btn = await page.query_selector("button.btn-social.github")
-                if github_btn and await github_btn.is_visible():
-                    break
+                github_btn = await _safe_query("button.btn-social.github")
+                if github_btn:
+                    try:
+                        if await github_btn.is_visible():
+                            break
+                    except Exception:
+                        pass
                 await page.wait_for_timeout(3000)
             if not github_btn:
                 print(f"⚠️ {self.account_name}: 未找到 GitHub 登录按钮")
                 return False
-            await github_btn.click()
+            try:
+                await github_btn.click()
+            except Exception as click_err:
+                # 点击已被处理但页面正在跳转时可能报错，不视为失败
+                if "context was destroyed" not in str(click_err) and "Navigation" not in str(click_err):
+                    print(f"⚠️ {self.account_name}: 点击 GitHub 按钮失败: {click_err}")
+                    return False
             print(f"ℹ️ {self.account_name}: 已点击 GitHub 登录按钮，等待跳转...")
 
             # 等待跳转结果：GitHub 登录页 / GitHub 授权页 / 直接跳回 linux.do
             for _ in range(30):
                 await page.wait_for_timeout(1000)
                 url = page.url
-                if "github.com/login" in url:
-                    break
-                if "github.com/login/oauth/authorize" in url or "github.com/oauth" in url:
+                if "github.com" in url:
                     break
                 if url.startswith("https://linux.do") and "/login" not in url:
                     print(f"✅ {self.account_name}: GitHub 会话有效，已登录 linux.do")
                     return True
-                if url.startswith("https://linux.do") and "/login" in url:
-                    # 仍在 linux.do 登录页（可能水合慢），再等等
-                    continue
 
             # GitHub 登录页：执行账号密码登录
             if "github.com/login" in page.url and self.github_username and self.github_password:
@@ -163,12 +175,16 @@ class LinuxDoSignIn:
                     print(f"✅ {self.account_name}: 已通过 GitHub 登录 linux.do")
                     return True
                 if "github.com" in url:
-                    authorize_btn = await page.query_selector("#js-oauth-authorize-btn, button[type=submit]")
-                    if authorize_btn and await authorize_btn.is_visible():
-                        print(f"ℹ️ {self.account_name}: 点击 GitHub 授权按钮")
-                        await authorize_btn.click()
-                        await page.wait_for_timeout(5000)
-                        continue
+                    authorize_btn = await _safe_query("#js-oauth-authorize-btn, button[type=submit]")
+                    if authorize_btn:
+                        try:
+                            if await authorize_btn.is_visible():
+                                print(f"ℹ️ {self.account_name}: 点击 GitHub 授权按钮")
+                                await authorize_btn.click()
+                                await page.wait_for_timeout(5000)
+                                continue
+                        except Exception:
+                            pass  # 跳转进行中，继续等
                 await page.wait_for_timeout(2000)
 
             print(f"⚠️ {self.account_name}: GitHub 登录超时，当前页面: {page.url}")
