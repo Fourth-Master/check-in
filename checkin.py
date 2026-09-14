@@ -31,17 +31,21 @@ class CheckIn:
         provider_config: ProviderConfig,
         global_proxy: dict | None = None,
         storage_state_dir: str = "storage-states",
+        github_accounts: list | None = None,
     ):
         """初始化签到管理器
 
         Args:
                 account_info: account 用户配置
                 proxy_config: 全局代理配置(可选)
+                github_accounts: 全局 GitHub 账号列表（供 linux.do 的 GitHub 登录使用，可选）
         """
         self.account_name = account_name
         self.safe_account_name = "".join(c if c.isalnum() else "_" for c in account_name)
         self.account_config = account_config
         self.provider_config = provider_config
+        # 全局 GitHub 账号（linux.do 登录页支持 GitHub OAuth，凭据从 ACCOUNTS_GITHUB 复用）
+        self.github_accounts = github_accounts or []
 
         # 将全局代理存入 account_config.extra，供 get_cdk 和 check_in_status 等函数使用
         if global_proxy:
@@ -1429,12 +1433,19 @@ class CheckIn:
 
             from sign_in_with_linuxdo import LinuxDoSignIn
 
+            # linux.do 登录页支持 GitHub OAuth：复用全局 GitHub 账号
+            # （linux.do 账号密码登录在数据中心/代理环境会被风控拦截，GitHub 登录稳定）
+            github_account = self.github_accounts[0] if self.github_accounts else None
+
             linuxdo = LinuxDoSignIn(
                 account_name=self.account_name,
                 provider_config=self.provider_config,
                 username=username,
                 password=password,
                 proxy=self.get_linuxdo_proxy(),
+                github_username=github_account.username if github_account else None,
+                github_password=github_account.password if github_account else None,
+                storage_state_dir=self.storage_state_dir,
             )
 
             success, result_data, oauth_browser_headers = await linuxdo.signin(
