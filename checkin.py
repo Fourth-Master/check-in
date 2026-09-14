@@ -1256,12 +1256,20 @@ class CheckIn:
                 password=password,
             )
 
-            success, result_data, oauth_browser_headers = await github.signin(
-                client_id=client_id_result["client_id"],
-                auth_state=auth_state_result.get("state"),
-                auth_cookies=auth_state_result.get("cookies", []),
-                cache_file_path=cache_file_path
-            )
+            # 总超时兜底（同 LinuxDoSignIn，防止无超时挂起拖垮整个 run）
+            try:
+                success, result_data, oauth_browser_headers = await asyncio.wait_for(
+                    github.signin(
+                        client_id=client_id_result["client_id"],
+                        auth_state=auth_state_result.get("state"),
+                        auth_cookies=auth_state_result.get("cookies", []),
+                        cache_file_path=cache_file_path,
+                    ),
+                    timeout=720,
+                )
+            except asyncio.TimeoutError:
+                print(f"❌ {self.account_name}: GitHub 登录授权总超时（12 分钟），放弃本账号")
+                return False, {"error": "GitHub 登录授权总超时"}
 
             # 检查是否成功获取 cookies 和 api_user
             if success and "cookies" in result_data and "api_user" in result_data:
@@ -1448,12 +1456,22 @@ class CheckIn:
                 storage_state_dir=self.storage_state_dir,
             )
 
-            success, result_data, oauth_browser_headers = await linuxdo.signin(
-                client_id=client_id_result["client_id"],
-                auth_state=auth_state_result["state"],
-                auth_cookies=auth_state_result.get("cookies", []),
-                cache_file_path=cache_file_path
-            )
+            # 总超时兜底：登录/授权流程内个别等待（质询 solver、页面操作）可能因浏览器
+            # 假死无限挂起（实测有账号卡 63 分钟拖垮整个 run）。正常最长路径（含 2FA
+            # wait-for-secrets 5 分钟）约 10 分钟，超时则放弃本账号继续下一个
+            try:
+                success, result_data, oauth_browser_headers = await asyncio.wait_for(
+                    linuxdo.signin(
+                        client_id=client_id_result["client_id"],
+                        auth_state=auth_state_result["state"],
+                        auth_cookies=auth_state_result.get("cookies", []),
+                        cache_file_path=cache_file_path,
+                    ),
+                    timeout=720,
+                )
+            except asyncio.TimeoutError:
+                print(f"❌ {self.account_name}: Linux.do 登录授权总超时（12 分钟），放弃本账号")
+                return False, {"error": "Linux.do 登录授权总超时"}
 
             # 检查是否成功获取 cookies 和 api_user
             if success and "cookies" in result_data and "api_user" in result_data:
