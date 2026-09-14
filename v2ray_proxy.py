@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 SOCKS_PORT = 10808
 HTTP_PORT = 10809
-TEST_URL = "https://api.ipify.org"
+TEST_URLS = ["https://linux.do", "https://api.ipify.org"]
 MAX_CANDIDATES = 5
 
 _KEEP_PROC = []  # 防止 Popen 对象被回收；子进程在脚本退出后继续运行
@@ -325,12 +325,29 @@ def wait_port(timeout: float = 10) -> bool:
 
 
 def test_node() -> tuple:
+    """节点连通性测试：必须同时通过目标站点（linux.do）TLS 与公网 IP 查询
+
+    只测 ipify 会漏掉证书不匹配/DNS 污染的坏节点（表现为 SSL_ERROR_BAD_CERT_DOMAIN），
+    用 linux.do 作为首要测试目标可提前暴露这类故障。
+    """
     from curl_cffi import requests as curl_requests
 
+    last_error = None
+    for url in TEST_URLS:
+        try:
+            resp = curl_requests.get(
+                url, proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
+            )
+            if resp.status_code >= 400:
+                return False, f"HTTP {resp.status_code} from {url}"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {str(e)[:100]} (url={url})"
+            return False, last_error
+    # 两个都通过，取出口 IP
     resp = curl_requests.get(
-        TEST_URL, proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
+        "https://api.ipify.org", proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
     )
-    return resp.status_code == 200, resp.text.strip()[:64]
+    return True, resp.text.strip()[:64]
 
 
 def set_github_output(key: str, value: str) -> None:
