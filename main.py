@@ -81,7 +81,13 @@ async def main():
                 continue
 
             print(f"🌀 正在处理 {account_name}，使用提供商 '{account_config.provider}'")
-            checkin = CheckIn(account_name, account_config, provider_config, global_proxy=app_config.global_proxy)
+            checkin = CheckIn(
+                account_name,
+                account_config,
+                provider_config,
+                global_proxy=app_config.global_proxy,
+                github_accounts=app_config.github_accounts,
+            )
             results = await checkin.execute()
 
             total_count += len(results)
