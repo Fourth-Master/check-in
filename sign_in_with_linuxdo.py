@@ -80,6 +80,35 @@ class LinuxDoSignIn:
                 except Exception:
                     return None
 
+            # 登录页可能先弹 Cloudflare 质询（质询页上没有 GitHub 按钮），先解决质询
+            for _cf_round in range(2):
+                try:
+                    _title = await page.title()
+                    _content = await page.content()
+                except Exception:
+                    await page.wait_for_timeout(3000)
+                    continue
+                if "Just a moment" not in _title and "Checking your browser" not in _content:
+                    break
+                print(f"ℹ️ {self.account_name}: 登录页有 Cloudflare 质询，正在自动解决（第 {_cf_round + 1}/2 轮）...")
+                try:
+                    await solver.solve_captcha(
+                        captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
+                    )
+                    print(f"✅ {self.account_name}: Cloudflare 质询已自动解决")
+                except Exception as solve_err:
+                    print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
+                try:
+                    await page.wait_for_selector("button.btn-social.github", state="visible", timeout=30000)
+                    break
+                except Exception:
+                    if _cf_round == 0:
+                        print(f"ℹ️ {self.account_name}: 质询未通过，刷新页面重试")
+                        try:
+                            await page.reload(wait_until="domcontentloaded")
+                        except Exception:
+                            pass
+
             # 等 GitHub 按钮出现并点击（页面异步水合；点击会触发跳转，期间 DOM 查询可能失败）
             github_btn = None
             for _ in range(5):
@@ -152,19 +181,23 @@ class LinuxDoSignIn:
                 except Exception as otp_err:
                     print(f"⚠️ {self.account_name}: 处理 GitHub 两步验证时出错: {otp_err}")
 
-                # 保存 GitHub 会话供后续复用（与 GitHubSignIn 同一缓存文件）
+                # 保存 GitHub 会话供后续复用（与 GitHubSignIn 同一缓存文件）；
+                # 仅在确认登录成功（存在 user_session）时保存，避免污染缓存
                 github_cache = self._github_cache_file()
                 if github_cache:
                     try:
+                        all_cookies = await page.context.cookies()
                         github_cookies = [
-                            c for c in await page.context.cookies() if ".github.com" in c.get("domain", "")
+                            c for c in all_cookies if c.get("domain", "") in ("github.com", ".github.com")
                         ]
-                        if github_cookies:
+                        if github_cookies and any(c["name"] == "user_session" for c in github_cookies):
                             os.makedirs(self.storage_state_dir, exist_ok=True)
                             state = {"cookies": github_cookies, "origins": []}
                             with open(github_cache, "w", encoding="utf-8") as f:
                                 json.dump(state, f, ensure_ascii=False, indent=2)
                             print(f"✅ {self.account_name}: GitHub 会话已保存到缓存")
+                        else:
+                            print(f"⚠️ {self.account_name}: GitHub 登录态未确认，跳过保存缓存")
                     except Exception as save_err:
                         print(f"⚠️ {self.account_name}: 保存 GitHub 会话失败: {save_err}")
 
@@ -256,7 +289,12 @@ class LinuxDoSignIn:
                 try:
                     with open(github_cache, encoding="utf-8") as f:
                         gh_state = json.load(f)
-                    gh_cookies = [c for c in gh_state.get("cookies", []) if ".github.com" in c.get("domain", "")]
+                    # __Host- 前缀 Cookie 的 domain 为 github.com（不带点），必须同时匹配两种写法
+                    gh_cookies = [
+                        c
+                        for c in gh_state.get("cookies", [])
+                        if c.get("domain", "") in ("github.com", ".github.com")
+                    ]
                     if gh_cookies:
                         await context.add_cookies(gh_cookies)
                         print(f"ℹ️ {self.account_name}: 已从 GitHub 缓存恢复 {len(gh_cookies)} 个 Cookie")
