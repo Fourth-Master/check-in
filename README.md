@@ -265,10 +265,21 @@ linux.do 会对 GitHub Actions 等数据中心 IP 进行限流（登录页返回
 - `LINUXDO_PROXY=true` 时，登录/授权 linux.do（`https://linux.do/`、`https://connect.linux.do/`）的浏览器流量使用 `PROXY` secret 中配置的代理
 - 未配置或为 `false` 时，访问 linux.do 与站点访问使用相同的代理策略（账号 `proxy` 字段控制）
 
-#### 3.5.2 预置 linux.do 会话（STORATE_STATES_LINUXDO，推荐）
+#### 3.5.2 linux.do 登录方式说明
 
-linux.do 的 Cloudflare 防护会对数据中心 IP（包括常见代理出口）弹出人机验证，自动登录可能被拦截。
-预置一个有效的 linux.do 会话后，脚本将跳过登录页直接授权，从根本上绕开该问题：
+linux.do 的 Cloudflare 防护会对数据中心 IP（包括常见代理出口）弹出人机验证，
+账号密码登录可能被静默拦截。登录方式的自动优先级如下：
+
+1. **Actions 会话缓存**：上次成功登录后的会话（缓存有效期内直接复用）
+2. **预置会话**（`STORATE_STATES_LINUXDO`，可选）：你自己浏览器导出的会话
+3. **GitHub 登录**（推荐配置）：点击 linux.do 登录页的 "Log in with GitHub"，
+   复用 `ACCOUNTS_GITHUB` 中的账号凭据与 GitHub 会话缓存，全自动化、不依赖手动导出
+4. **账号密码登录**：以上均失败时的最后回退（数据中心/代理环境下大概率被拦截）
+
+配置了 `ACCOUNTS_GITHUB`（即使该账号没有配置 `"github": true` 的签到项），
+linux.do 登录即可使用 GitHub 方式，无需其他配置。
+
+预置会话（第 2 层兜底，可选）：
 
 在 Settings -> Environments -> production -> Environment secrets 中添加：
    - Name: `STORATE_STATES_LINUXDO`
@@ -280,7 +291,7 @@ linux.do 的 Cloudflare 防护会对数据中心 IP（包括常见代理出口�
 2. 用浏览器插件（如 Cookie-Editor）导出 linux.do 的会话 Cookie，
    组装为 Playwright storage state 格式：`{"cookies": [...], "origins": []}`。
 
-注意：会话有效期有限，过期后（日志提示缓存会话失效）需重新生成。
+注意：会话有效期有限，过期后（日志提示缓存会话失效）会自动回退到 GitHub 登录。
 
 #### 3.5.3 v2ray 订阅代理（V2RAY_SUBSCRIPTION，可选）
 
