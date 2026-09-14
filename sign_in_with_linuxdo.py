@@ -3,6 +3,7 @@
 使用 Camoufox 绕过 Cloudflare 验证执行 Linux.do 签到
 """
 
+import hashlib
 import json
 import os
 from urllib.parse import urlparse, parse_qs
@@ -26,6 +27,9 @@ class LinuxDoSignIn:
         username: str,
         password: str,
         proxy: dict | None = None,
+        github_username: str | None = None,
+        github_password: str | None = None,
+        storage_state_dir: str = "storage-states",
     ):
         """初始化
 
@@ -35,12 +39,145 @@ class LinuxDoSignIn:
             username: Linux.do 用户名
             password: Linux.do 密码
             proxy: 访问 linux.do 使用的代理配置（Camoufox/Playwright 格式），为 None 时直连
+            github_username: GitHub 用户名（用于 linux.do 的 GitHub 登录，可选）
+            github_password: GitHub 密码
+            storage_state_dir: 会话缓存目录
         """
         self.account_name = account_name
         self.provider_config = provider_config
         self.username = username
         self.password = password
         self.proxy = proxy
+        self.github_username = github_username
+        self.github_password = github_password
+        self.storage_state_dir = storage_state_dir
+
+    def _github_cache_file(self) -> str | None:
+        """GitHub 会话缓存文件路径（与 GitHubSignIn 共用同一份缓存）"""
+        if not self.github_username:
+            return None
+        username_hash = hashlib.sha256(self.github_username.encode("utf-8")).hexdigest()[:8]
+        return f"{self.storage_state_dir}/github_{username_hash}_storage_state.json"
+
+    async def _login_via_github(self, page, solver) -> bool:
+        """在 linux.do 登录页通过 GitHub OAuth 完成登录
+
+        linux.do 账号密码登录在数据中心/代理环境下会被风控静默拦截，
+        而 GitHub 登录稳定可用。流程：点击 linux.do 的 GitHub 按钮 →
+        GitHub 已登录则授权后跳回；未登录则先完成 GitHub 账号密码 + 2FA。
+
+        Returns:
+            是否成功登录 linux.do
+        """
+        print(f"ℹ️ {self.account_name}: 尝试通过 GitHub 登录 linux.do")
+        try:
+            await page.goto("https://linux.do/login", wait_until="domcontentloaded", timeout=90000)
+
+            # 等 GitHub 按钮出现并点击（页面异步水合）
+            github_btn = None
+            for _ in range(5):
+                github_btn = await page.query_selector("button.btn-social.github")
+                if github_btn and await github_btn.is_visible():
+                    break
+                await page.wait_for_timeout(3000)
+            if not github_btn:
+                print(f"⚠️ {self.account_name}: 未找到 GitHub 登录按钮")
+                return False
+            await github_btn.click()
+            print(f"ℹ️ {self.account_name}: 已点击 GitHub 登录按钮，等待跳转...")
+
+            # 等待跳转结果：GitHub 登录页 / GitHub 授权页 / 直接跳回 linux.do
+            for _ in range(30):
+                await page.wait_for_timeout(1000)
+                url = page.url
+                if "github.com/login" in url:
+                    break
+                if "github.com/login/oauth/authorize" in url or "github.com/oauth" in url:
+                    break
+                if url.startswith("https://linux.do") and "/login" not in url:
+                    print(f"✅ {self.account_name}: GitHub 会话有效，已登录 linux.do")
+                    return True
+                if url.startswith("https://linux.do") and "/login" in url:
+                    # 仍在 linux.do 登录页（可能水合慢），再等等
+                    continue
+
+            # GitHub 登录页：执行账号密码登录
+            if "github.com/login" in page.url and self.github_username and self.github_password:
+                print(f"ℹ️ {self.account_name}: GitHub 会话无效，正在登录 GitHub")
+                await page.fill("#login_field", self.github_username)
+                await page.fill("#password", self.github_password)
+                await page.click('input[type="submit"][value="Sign in"]')
+                await page.wait_for_timeout(8000)
+
+                # 两步验证（复用 wait-for-secrets 机制）
+                try:
+                    otp_input = await page.query_selector('#app_totp, input[name="app_otp"], input[name="otp"]')
+                    if otp_input:
+                        print(f"🔐 {self.account_name}: GitHub 需要两步验证，尝试通过 wait-for-secrets 获取 OTP")
+                        otp_code = None
+                        try:
+                            from utils.wait_for_secrets import WaitForSecrets
+
+                            wait_for_secrets = WaitForSecrets()
+                            secrets = wait_for_secrets.get(
+                                {"OTP": {"name": "GitHub 两步验证 OTP", "description": "来自身份验证器应用的 OTP"}},
+                                timeout=5,
+                                notification={"title": "GitHub 两步验证 OTP", "message": "请查看邮箱验证码并通过链接输入"},
+                            )
+                            if secrets and "OTP" in secrets:
+                                otp_code = secrets["OTP"]
+                        except Exception as wf_err:
+                            print(f"⚠️ {self.account_name}: wait-for-secrets 失败: {wf_err}")
+                        if otp_code:
+                            await otp_input.fill(otp_code)
+                            try:
+                                await page.wait_for_url(lambda url: "github.com/login" not in url, timeout=15000)
+                            except Exception:
+                                pass
+                        else:
+                            print(f"⚠️ {self.account_name}: 无法获取 OTP，GitHub 登录无法继续")
+                            return False
+                except Exception as otp_err:
+                    print(f"⚠️ {self.account_name}: 处理 GitHub 两步验证时出错: {otp_err}")
+
+                # 保存 GitHub 会话供后续复用（与 GitHubSignIn 同一缓存文件）
+                github_cache = self._github_cache_file()
+                if github_cache:
+                    try:
+                        github_cookies = [
+                            c for c in await page.context.cookies() if ".github.com" in c.get("domain", "")
+                        ]
+                        if github_cookies:
+                            os.makedirs(self.storage_state_dir, exist_ok=True)
+                            state = {"cookies": github_cookies, "origins": []}
+                            with open(github_cache, "w", encoding="utf-8") as f:
+                                json.dump(state, f, ensure_ascii=False, indent=2)
+                            print(f"✅ {self.account_name}: GitHub 会话已保存到缓存")
+                    except Exception as save_err:
+                        print(f"⚠️ {self.account_name}: 保存 GitHub 会话失败: {save_err}")
+
+            # GitHub 授权页（linux.do 应用）：点击授权按钮（已授权过的应用会直接跳回）
+            for _ in range(20):
+                url = page.url
+                if url.startswith("https://linux.do") and "/login" not in url:
+                    print(f"✅ {self.account_name}: 已通过 GitHub 登录 linux.do")
+                    return True
+                if "github.com" in url:
+                    authorize_btn = await page.query_selector("#js-oauth-authorize-btn, button[type=submit]")
+                    if authorize_btn and await authorize_btn.is_visible():
+                        print(f"ℹ️ {self.account_name}: 点击 GitHub 授权按钮")
+                        await authorize_btn.click()
+                        await page.wait_for_timeout(5000)
+                        continue
+                await page.wait_for_timeout(2000)
+
+            print(f"⚠️ {self.account_name}: GitHub 登录超时，当前页面: {page.url}")
+            return False
+
+        except Exception as e:
+            print(f"❌ {self.account_name}: GitHub 登录 linux.do 时发生错误: {e}")
+            await take_screenshot(page, "linuxdo_github_login_error", self.account_name)
+            return False
 
     async def signin(
         self,
@@ -96,6 +233,19 @@ class LinuxDoSignIn:
                 print(f"ℹ️ {self.account_name}: 未找到缓存文件，将全新开始")
 
             context = await browser.new_context(storage_state=storage_state)
+
+            # 合并 GitHub 会话 Cookie（用于 linux.do 的 GitHub 登录，与 GitHubSignIn 共用缓存）
+            github_cache = self._github_cache_file()
+            if github_cache and os.path.exists(github_cache):
+                try:
+                    with open(github_cache, encoding="utf-8") as f:
+                        gh_state = json.load(f)
+                    gh_cookies = [c for c in gh_state.get("cookies", []) if ".github.com" in c.get("domain", "")]
+                    if gh_cookies:
+                        await context.add_cookies(gh_cookies)
+                        print(f"ℹ️ {self.account_name}: 已从 GitHub 缓存恢复 {len(gh_cookies)} 个 Cookie")
+                except Exception as gh_err:
+                    print(f"⚠️ {self.account_name}: 加载 GitHub 会话缓存失败: {gh_err}")
 
             # 设置从参数获取的 auth cookies 到页面上下文
             if auth_cookies:
@@ -217,234 +367,251 @@ class LinuxDoSignIn:
                             )
                             await take_screenshot(page, "logged_in_failed", self.account_name)
                             return False, {"error": "Linux.do 登录失败"}, None
-                        
-                        try:
-                            print(f"ℹ️ {self.account_name}: 开始登录 linux.do")
 
+                        # 优先尝试 GitHub 登录（linux.do 账号密码登录在数据中心/代理
+                        # 环境会被风控静默拦截，GitHub 登录稳定）
+                        github_logged_in = False
+                        if self.github_username and self.github_password:
                             try:
-                                await page.goto(
-                                    "https://linux.do/login",
-                                    wait_until="domcontentloaded",
-                                    timeout=90000,
-                                )
-                            except Exception as goto_err:
-                                print(
-                                    f"⚠️ {self.account_name}: 登录页加载缓慢或失败（{type(goto_err).__name__}），"
-                                    "代理出口可能不稳定"
-                                )
-
-                            # Cloudflare 质询页处理：质询脚本经代理可能加载缓慢或失败，
-                            # 自动解决 + 等待 + 刷新最多重试 2 轮
-                            for _cf_attempt in (1, 2):
-                                page_title = await page.title()
-                                page_content = await page.content()
-
-                                if "Just a moment" not in page_title and "Checking your browser" not in page_content:
-                                    break
-
-                                print(
-                                    f"ℹ️ {self.account_name}: 检测到 Cloudflare 验证，"
-                                    f"正在自动解决（第 {_cf_attempt}/2 轮）..."
-                                )
+                                github_logged_in = await self._login_via_github(page, solver)
+                            except Exception as gh_err:
+                                print(f"⚠️ {self.account_name}: GitHub 登录 linux.do 失败: {gh_err}")
+                            if github_logged_in:
+                                # 登录成功，保存 linux.do 会话缓存
                                 try:
-                                    await solver.solve_captcha(
-                                        captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
-                                    )
-                                    print(f"✅ {self.account_name}: Cloudflare 验证已自动解决")
-                                except Exception as solve_err:
-                                    print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
-
-                                # 等待质询页消失（登录表单出现），最多 45 秒
-                                try:
-                                    await page.wait_for_selector("#login-button", state="visible", timeout=45000)
-                                    break
-                                except Exception:
-                                    if _cf_attempt == 1:
-                                        print(f"ℹ️ {self.account_name}: 质询未通过，刷新页面重试")
-                                        try:
-                                            await page.reload(wait_until="domcontentloaded")
-                                        except Exception:
-                                            pass
-
-                            # 等待登录表单可见（新登录页为 Ember 异步水合，需等表单交互就绪）
-                            try:
-                                await page.wait_for_selector("#login-button", state="visible", timeout=15000)
-                            except Exception:
-                                print(f"⚠️ {self.account_name}: 等待登录按钮超时，继续尝试")
-
-                            # 监听登录相关响应（/session 为 Ember XHR，POST /login 为免 JS 原生表单提交）
-                            login_api_responses = []
-
-                            def _capture_login_response(response):
-                                try:
-                                    if response.request.method == "POST" and (
-                                        "/session" in response.url or response.url.rstrip("/").endswith("/login")
-                                    ):
-                                        login_api_responses.append(response)
+                                    await context.storage_state(path=cache_file_path)
+                                    print(f"✅ {self.account_name}: 会话缓存已保存到缓存文件")
                                 except Exception:
                                     pass
 
-                            page.on("response", _capture_login_response)
-
-                            await page.fill("#login-account-name", self.username)
-                            await page.wait_for_timeout(2000)
-                            await page.fill("#login-account-password", self.password)
-                            await page.wait_for_timeout(2000)
-
-                            # 页面异步水合可能重置已填写的表单，点击前校验一次
-                            for _selector, _value in (
-                                ("#login-account-name", self.username),
-                                ("#login-account-password", self.password),
-                            ):
-                                try:
-                                    if (await page.input_value(_selector)) != _value:
-                                        print(f"⚠️ {self.account_name}: 表单字段被页面重置，重新填写 {_selector}")
-                                        await page.fill(_selector, _value)
-                                except Exception:
-                                    pass
-
-                            # 等待登录结果：跳转离开 /login，或登录接口返回响应
-                            async def _wait_login_result(seconds: int) -> bool:
-                                for _ in range(seconds):
-                                    if "/login" not in page.url or login_api_responses:
-                                        return True
-                                    await page.wait_for_timeout(1000)
-                                return bool(login_api_responses) or "/login" not in page.url
-
-                            async def _wait_turnstile_token(timeout_ms: int) -> bool:
-                                """等待 Cloudflare Turnstile 令牌存在（新登录页提交必需）"""
-                                try:
-                                    await page.wait_for_function(
-                                        """() => {
-                                            const el = document.querySelector('input[name="cf-turnstile-response"]');
-                                            return el && el.value && el.value.length > 10;
-                                        }""",
-                                        timeout=timeout_ms,
-                                    )
-                                    return True
-                                except Exception:
-                                    return False
-
-                            if await _wait_turnstile_token(30000):
-                                print(f"ℹ️ {self.account_name}: Turnstile 令牌已就绪")
-                            else:
-                                print(f"⚠️ {self.account_name}: 等待 Turnstile 令牌超时，继续尝试提交")
-
-                            # 提交方式 1：点击页面 CTA 登录按钮，最多 3 轮。
-                            # 令牌经代理刷新失败时（challenges.cloudflare.com 不可达），客户端会
-                            # 静默拦截提交且无任何报错；令牌组件恢复后会重新生成令牌，重试即可
-                            for _click_round in (1, 2, 3):
-                                # 等待令牌；页面重渲染可能移除按钮元素，点击前重新等待其出现
-                                await _wait_turnstile_token(20000)
-                                for _btn_wait in range(3):
-                                    try:
-                                        await page.click("#login-button", timeout=10000)
-                                        break
-                                    except Exception as click_err:
-                                        print(
-                                            f"⚠️ {self.account_name}: 点击登录按钮失败"
-                                            f"（{type(click_err).__name__}），等待按钮重新出现"
-                                        )
-                                        try:
-                                            await page.wait_for_selector(
-                                                "#login-button", state="visible", timeout=10000
-                                            )
-                                        except Exception:
-                                            pass
-                                print(f"ℹ️ {self.account_name}: 已点击登录按钮（第 {_click_round}/3 轮）")
-                                if await _wait_login_result(12):
-                                    break
-                                if _click_round < 3:
-                                    print(f"⚠️ {self.account_name}: 点击后无登录请求，等待令牌恢复后重试")
-
-                            if not await _wait_login_result(15):
-                                # 提交方式 2：密码框内回车提交
-                                print(f"⚠️ {self.account_name}: 点击登录按钮无响应，尝试回车提交")
-                                try:
-                                    await page.press("#login-account-password", "Enter")
-                                except Exception:
-                                    pass
-                                await _wait_login_result(10)
-
-                            if not login_api_responses and "/login" in page.url:
-                                # 提交方式 3：使用页面自带的免 JS 原生表单（hidden-login-form）直接提交
-                                print(f"⚠️ {self.account_name}: 回车提交也无响应，尝试原生表单提交")
-                                try:
-                                    await page.evaluate(
-                                        """(creds) => {
-                                            const f = document.querySelector('#hidden-login-form');
-                                            if (!f) return false;
-                                            const u = f.querySelector('#signin_username');
-                                            const p = f.querySelector('#signin_password');
-                                            if (!u || !p) return false;
-                                            u.value = creds.u;
-                                            p.value = creds.p;
-                                            const btn = f.querySelector('#signin-button');
-                                            if (btn) btn.click();
-                                            return true;
-                                        }""",
-                                        {"u": self.username, "p": self.password},
-                                    )
-                                except Exception as eval_err:
-                                    print(f"⚠️ {self.account_name}: 原生表单提交失败: {eval_err}")
-                                await _wait_login_result(15)
-
-                            for _resp in login_api_responses:
-                                try:
-                                    _status = _resp.status
-                                    _detail = ""
-                                    try:
-                                        _body = await _resp.json()
-                                        _detail = _body.get("message") or _body.get("error") or ""
-                                    except Exception:
-                                        try:
-                                            _detail = (await _resp.text())[:120]
-                                        except Exception:
-                                            _detail = ""
-                                    if _status == 200 and "/session" in _resp.url:
-                                        print(f"ℹ️ {self.account_name}: 登录接口响应 HTTP 200：{_detail or '(无消息体)'}")
-                                    else:
-                                        print(
-                                            f"⚠️ {self.account_name}: 登录请求响应 HTTP {_status}：{_detail}"
-                                        )
-                                except Exception:
-                                    print(f"⚠️ {self.account_name}: 登录请求响应无法解析")
-                            if not login_api_responses:
-                                print(
-                                    f"⚠️ {self.account_name}: 未捕获到任何登录请求，页面 URL: {page.url}，"
-                                    "页面脚本可能未完全加载"
-                                )
-                            page.remove_listener("response", _capture_login_response)
-
-                            await page.wait_for_timeout(10000)
-
-                            await save_page_content_to_file(page, "sign_in_result", self.account_name, prefix="linuxdo")
-
+                        if not github_logged_in:
                             try:
-                                current_url = page.url
-                                print(f"ℹ️ {self.account_name}: 当前页面 URL 为 {current_url}")
-                                if "linux.do/challenge" in current_url:
+                                print(f"ℹ️ {self.account_name}: 开始登录 linux.do")
+
+                                try:
+                                    await page.goto(
+                                        "https://linux.do/login",
+                                        wait_until="domcontentloaded",
+                                        timeout=90000,
+                                    )
+                                except Exception as goto_err:
                                     print(
-                                        f"⚠️ {self.account_name}: 检测到 Cloudflare 验证，"
-                                        "Camoufox 应会自动绕过，等待中..."
+                                        f"⚠️ {self.account_name}: 登录页加载缓慢或失败（{type(goto_err).__name__}），"
+                                        "代理出口可能不稳定"
                                     )
-                                    # 等待 Cloudflare 验证完成
-                                    await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=60000)
-                                    print(f"✅ {self.account_name}: 成功绕过 Cloudflare 验证")
+
+                                # Cloudflare 质询页处理：质询脚本经代理可能加载缓慢或失败，
+                                # 自动解决 + 等待 + 刷新最多重试 2 轮
+                                for _cf_attempt in (1, 2):
+                                    page_title = await page.title()
+                                    page_content = await page.content()
+
+                                    if "Just a moment" not in page_title and "Checking your browser" not in page_content:
+                                        break
+
+                                    print(
+                                        f"ℹ️ {self.account_name}: 检测到 Cloudflare 验证，"
+                                        f"正在自动解决（第 {_cf_attempt}/2 轮）..."
+                                    )
+                                    try:
+                                        await solver.solve_captcha(
+                                            captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
+                                        )
+                                        print(f"✅ {self.account_name}: Cloudflare 验证已自动解决")
+                                    except Exception as solve_err:
+                                        print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
+
+                                    # 等待质询页消失（登录表单出现），最多 45 秒
+                                    try:
+                                        await page.wait_for_selector("#login-button", state="visible", timeout=45000)
+                                        break
+                                    except Exception:
+                                        if _cf_attempt == 1:
+                                            print(f"ℹ️ {self.account_name}: 质询未通过，刷新页面重试")
+                                            try:
+                                                await page.reload(wait_until="domcontentloaded")
+                                            except Exception:
+                                                pass
+
+                                # 等待登录表单可见（新登录页为 Ember 异步水合，需等表单交互就绪）
+                                try:
+                                    await page.wait_for_selector("#login-button", state="visible", timeout=15000)
+                                except Exception:
+                                    print(f"⚠️ {self.account_name}: 等待登录按钮超时，继续尝试")
+
+                                # 监听登录相关响应（/session 为 Ember XHR，POST /login 为免 JS 原生表单提交）
+                                login_api_responses = []
+
+                                def _capture_login_response(response):
+                                    try:
+                                        if response.request.method == "POST" and (
+                                            "/session" in response.url or response.url.rstrip("/").endswith("/login")
+                                        ):
+                                            login_api_responses.append(response)
+                                    except Exception:
+                                        pass
+
+                                page.on("response", _capture_login_response)
+
+                                await page.fill("#login-account-name", self.username)
+                                await page.wait_for_timeout(2000)
+                                await page.fill("#login-account-password", self.password)
+                                await page.wait_for_timeout(2000)
+
+                                # 页面异步水合可能重置已填写的表单，点击前校验一次
+                                for _selector, _value in (
+                                    ("#login-account-name", self.username),
+                                    ("#login-account-password", self.password),
+                                ):
+                                    try:
+                                        if (await page.input_value(_selector)) != _value:
+                                            print(f"⚠️ {self.account_name}: 表单字段被页面重置，重新填写 {_selector}")
+                                            await page.fill(_selector, _value)
+                                    except Exception:
+                                        pass
+
+                                # 等待登录结果：跳转离开 /login，或登录接口返回响应
+                                async def _wait_login_result(seconds: int) -> bool:
+                                    for _ in range(seconds):
+                                        if "/login" not in page.url or login_api_responses:
+                                            return True
+                                        await page.wait_for_timeout(1000)
+                                    return bool(login_api_responses) or "/login" not in page.url
+
+                                async def _wait_turnstile_token(timeout_ms: int) -> bool:
+                                    """等待 Cloudflare Turnstile 令牌存在（新登录页提交必需）"""
+                                    try:
+                                        await page.wait_for_function(
+                                            """() => {
+                                                const el = document.querySelector('input[name="cf-turnstile-response"]');
+                                                return el && el.value && el.value.length > 10;
+                                            }""",
+                                            timeout=timeout_ms,
+                                        )
+                                        return True
+                                    except Exception:
+                                        return False
+
+                                if await _wait_turnstile_token(30000):
+                                    print(f"ℹ️ {self.account_name}: Turnstile 令牌已就绪")
+                                else:
+                                    print(f"⚠️ {self.account_name}: 等待 Turnstile 令牌超时，继续尝试提交")
+
+                                # 提交方式 1：点击页面 CTA 登录按钮，最多 3 轮。
+                                # 令牌经代理刷新失败时（challenges.cloudflare.com 不可达），客户端会
+                                # 静默拦截提交且无任何报错；令牌组件恢复后会重新生成令牌，重试即可
+                                for _click_round in (1, 2, 3):
+                                    # 等待令牌；页面重渲染可能移除按钮元素，点击前重新等待其出现
+                                    await _wait_turnstile_token(20000)
+                                    for _btn_wait in range(3):
+                                        try:
+                                            await page.click("#login-button", timeout=10000)
+                                            break
+                                        except Exception as click_err:
+                                            print(
+                                                f"⚠️ {self.account_name}: 点击登录按钮失败"
+                                                f"（{type(click_err).__name__}），等待按钮重新出现"
+                                            )
+                                            try:
+                                                await page.wait_for_selector(
+                                                    "#login-button", state="visible", timeout=10000
+                                                )
+                                            except Exception:
+                                                pass
+                                    print(f"ℹ️ {self.account_name}: 已点击登录按钮（第 {_click_round}/3 轮）")
+                                    if await _wait_login_result(12):
+                                        break
+                                    if _click_round < 3:
+                                        print(f"⚠️ {self.account_name}: 点击后无登录请求，等待令牌恢复后重试")
+
+                                if not await _wait_login_result(15):
+                                    # 提交方式 2：密码框内回车提交
+                                    print(f"⚠️ {self.account_name}: 点击登录按钮无响应，尝试回车提交")
+                                    try:
+                                        await page.press("#login-account-password", "Enter")
+                                    except Exception:
+                                        pass
+                                    await _wait_login_result(10)
+
+                                if not login_api_responses and "/login" in page.url:
+                                    # 提交方式 3：使用页面自带的免 JS 原生表单（hidden-login-form）直接提交
+                                    print(f"⚠️ {self.account_name}: 回车提交也无响应，尝试原生表单提交")
+                                    try:
+                                        await page.evaluate(
+                                            """(creds) => {
+                                                const f = document.querySelector('#hidden-login-form');
+                                                if (!f) return false;
+                                                const u = f.querySelector('#signin_username');
+                                                const p = f.querySelector('#signin_password');
+                                                if (!u || !p) return false;
+                                                u.value = creds.u;
+                                                p.value = creds.p;
+                                                const btn = f.querySelector('#signin-button');
+                                                if (btn) btn.click();
+                                                return true;
+                                            }""",
+                                            {"u": self.username, "p": self.password},
+                                        )
+                                    except Exception as eval_err:
+                                        print(f"⚠️ {self.account_name}: 原生表单提交失败: {eval_err}")
+                                    await _wait_login_result(15)
+
+                                for _resp in login_api_responses:
+                                    try:
+                                        _status = _resp.status
+                                        _detail = ""
+                                        try:
+                                            _body = await _resp.json()
+                                            _detail = _body.get("message") or _body.get("error") or ""
+                                        except Exception:
+                                            try:
+                                                _detail = (await _resp.text())[:120]
+                                            except Exception:
+                                                _detail = ""
+                                        if _status == 200 and "/session" in _resp.url:
+                                            print(f"ℹ️ {self.account_name}: 登录接口响应 HTTP 200：{_detail or '(无消息体)'}")
+                                        else:
+                                            print(
+                                                f"⚠️ {self.account_name}: 登录请求响应 HTTP {_status}：{_detail}"
+                                            )
+                                    except Exception:
+                                        print(f"⚠️ {self.account_name}: 登录请求响应无法解析")
+                                if not login_api_responses:
+                                    print(
+                                        f"⚠️ {self.account_name}: 未捕获到任何登录请求，页面 URL: {page.url}，"
+                                        "页面脚本可能未完全加载"
+                                    )
+                                page.remove_listener("response", _capture_login_response)
+
+                                await page.wait_for_timeout(10000)
+
+                                await save_page_content_to_file(page, "sign_in_result", self.account_name, prefix="linuxdo")
+
+                                try:
+                                    current_url = page.url
+                                    print(f"ℹ️ {self.account_name}: 当前页面 URL 为 {current_url}")
+                                    if "linux.do/challenge" in current_url:
+                                        print(
+                                            f"⚠️ {self.account_name}: 检测到 Cloudflare 验证，"
+                                            "Camoufox 应会自动绕过，等待中..."
+                                        )
+                                        # 等待 Cloudflare 验证完成
+                                        await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=60000)
+                                        print(f"✅ {self.account_name}: 成功绕过 Cloudflare 验证")
+
+                                except Exception as e:
+                                    print(f"⚠️ {self.account_name}: 可能存在 Cloudflare 验证: {e}")
+                                    # 即使超时，也尝试继续
+                                    pass
+
+                                # 保存新的会话状态
+                                await context.storage_state(path=cache_file_path)
+                                print(f"✅ {self.account_name}: 会话缓存已保存到缓存文件")
 
                             except Exception as e:
-                                print(f"⚠️ {self.account_name}: 可能存在 Cloudflare 验证: {e}")
-                                # 即使超时，也尝试继续
-                                pass
-
-                            # 保存新的会话状态
-                            await context.storage_state(path=cache_file_path)
-                            print(f"✅ {self.account_name}: 会话缓存已保存到缓存文件")
-
-                        except Exception as e:
-                            print(f"❌ {self.account_name}: 登录 linux.do 时发生错误: {e}")
-                            await take_screenshot(page, "signin_bypass_error", self.account_name)
-                            return False, {"error": "Linux.do 登录出错"}, None
+                                print(f"❌ {self.account_name}: 登录 linux.do 时发生错误: {e}")
+                                await take_screenshot(page, "signin_bypass_error", self.account_name)
+                                return False, {"error": "Linux.do 登录出错"}, None
 
                         # 登录后访问授权页面
                         try:
