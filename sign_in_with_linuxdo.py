@@ -75,7 +75,7 @@ class LinuxDoSignIn:
             humanize=True,
             locale="en-US",
             os="macos",  # 强制使用 macOS 指纹，避免跨平台指纹不一致问题
-            geoip=True if self.proxy else False,
+            geoip=False,  # geoip 查询经代理易超时且慢代理下指纹生成不稳定，固定指纹更可靠
             proxy=self.proxy,
             config={
                 "forceScopeAccess": True,
@@ -278,8 +278,23 @@ class LinuxDoSignIn:
                             # 令牌经代理刷新失败时（challenges.cloudflare.com 不可达），客户端会
                             # 静默拦截提交且无任何报错；令牌组件恢复后会重新生成令牌，重试即可
                             for _click_round in (1, 2, 3):
+                                # 等待令牌；页面重渲染可能移除按钮元素，点击前重新等待其出现
                                 await _wait_turnstile_token(20000)
-                                await page.click("#login-button")
+                                for _btn_wait in range(3):
+                                    try:
+                                        await page.click("#login-button", timeout=10000)
+                                        break
+                                    except Exception as click_err:
+                                        print(
+                                            f"⚠️ {self.account_name}: 点击登录按钮失败"
+                                            f"（{type(click_err).__name__}），等待按钮重新出现"
+                                        )
+                                        try:
+                                            await page.wait_for_selector(
+                                                "#login-button", state="visible", timeout=10000
+                                            )
+                                        except Exception:
+                                            pass
                                 print(f"ℹ️ {self.account_name}: 已点击登录按钮（第 {_click_round}/3 轮）")
                                 if await _wait_login_result(12):
                                     break
