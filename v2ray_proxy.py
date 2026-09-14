@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 SOCKS_PORT = 10808
 HTTP_PORT = 10809
-TEST_URLS = ["https://linux.do", "https://api.ipify.org"]
+
 MAX_CANDIDATES = 5
 
 _KEEP_PROC = []  # 防止 Popen 对象被回收；子进程在脚本退出后继续运行
@@ -325,29 +325,34 @@ def wait_port(timeout: float = 10) -> bool:
 
 
 def test_node() -> tuple:
-    """节点连通性测试：必须同时通过目标站点（linux.do）TLS 与公网 IP 查询
+    """节点连通性测试
 
-    只测 ipify 会漏掉证书不匹配/DNS 污染的坏节点（表现为 SSL_ERROR_BAD_CERT_DOMAIN），
-    用 linux.do 作为首要测试目标可提前暴露这类故障。
+    对 linux.do 只要求 TLS 握手成功（任何 HTTP 状态码均可）：数据中心出口 IP 被
+    Cloudflare 返回 403/质询页是正常现象，浏览器流程本身会处理质询；真正要排除的
+    是 TLS 证书错误（SSL_ERROR_BAD_CERT_DOMAIN）与完全连不通的坏节点。
+    出口 IP 查询必须返回 200。
     """
     from curl_cffi import requests as curl_requests
 
-    last_error = None
-    for url in TEST_URLS:
-        try:
-            resp = curl_requests.get(
-                url, proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
-            )
-            if resp.status_code >= 400:
-                return False, f"HTTP {resp.status_code} from {url}"
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {str(e)[:100]} (url={url})"
-            return False, last_error
-    # 两个都通过，取出口 IP
-    resp = curl_requests.get(
-        "https://api.ipify.org", proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
-    )
-    return True, resp.text.strip()[:64]
+    try:
+        curl_requests.get(
+            "https://linux.do", proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
+        )
+    except Exception as e:
+        return False, f"linux.do TLS 失败: {type(e).__name__}: {str(e)[:100]}"
+
+    try:
+        resp = curl_requests.get(
+            "https://api.ipify.org",
+            proxy=f"socks5://127.0.0.1:{SOCKS_PORT}",
+            timeout=20,
+            impersonate="chrome136",
+        )
+        if resp.status_code != 200:
+            return False, f"出口 IP 查询返回 HTTP {resp.status_code}"
+        return True, resp.text.strip()[:64]
+    except Exception as e:
+        return False, f"出口 IP 查询失败: {type(e).__name__}: {str(e)[:100]}"
 
 
 def set_github_output(key: str, value: str) -> None:
