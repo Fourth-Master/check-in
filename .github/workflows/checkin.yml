@@ -26,6 +26,7 @@ jobs:
       contents: read
     runs-on: windows-2025
     environment: production
+    timeout-minutes: 60
     env:
       PYTHONIOENCODING: utf-8
     steps:
@@ -164,7 +165,7 @@ jobs:
         uv run python -u main.py
 
     - name: 保存登录状态缓存
-      if: hashFiles('storage-states/*.json') != ''
+      if: ${{ always() && hashFiles('storage-states/*.json') != '' }}
       uses: actions/cache/save@v4
       with:
         path: |
