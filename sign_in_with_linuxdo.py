@@ -126,14 +126,45 @@ class LinuxDoSignIn:
                             print(
                                 f"ℹ️ {self.account_name}: 已重定向到应用页面 {response.url if response else '无'}"
                             )
+
+                            # 授权流程是多级重定向链（authorize -> sso_provider -> sso_callback -> 应用页），
+                            # domcontentloaded 可能停在中间页。等待跳转链完成（URL 稳定 2 秒）
+                            async def _wait_redirect_settle(max_wait_s: int = 20) -> None:
+                                last_url, stable = page.url, 0
+                                for _ in range(max_wait_s * 2):
+                                    await page.wait_for_timeout(500)
+                                    if page.url == last_url:
+                                        stable += 1
+                                        if stable >= 4:  # 2 秒无变化视为稳定
+                                            return
+                                    else:
+                                        last_url, stable = page.url, 0
+
+                            await _wait_redirect_settle(20)
+                            final_url = page.url
+                            if final_url != (response.url if response else ""):
+                                print(f"ℹ️ {self.account_name}: 重定向链完成后页面为 {final_url}")
                             await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
 
                             # 登录后可能直接跳转回应用页面
-                            if response and response.url.startswith(self.provider_config.origin):
+                            if final_url.startswith(self.provider_config.origin):
                                 is_logged_in = True
                                 print(
                                     f"✅ {self.account_name}: 已通过缓存登录，继续进行授权"
                                 )
+                            elif "sso_provider" in final_url or "sso_callback" in final_url:
+                                # SSO 中间跳转说明 linux.do 会话有效（过期会回到登录页）
+                                is_logged_in = True
+                                print(
+                                    f"✅ {self.account_name}: 会话有效（SSO 跳转中），继续等待授权页面"
+                                )
+                                try:
+                                    await page.wait_for_selector(
+                                        'a[href^="/oauth2/approve"], input[type="submit"]',
+                                        timeout=20000,
+                                    )
+                                except Exception:
+                                    pass
                             else:
                                 # 检查是否出现授权按钮（表示已登录）
                                 allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
