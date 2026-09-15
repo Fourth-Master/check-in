@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 SOCKS_PORT = 10808
 HTTP_PORT = 10809
 
-MAX_CANDIDATES = 5
+MAX_CANDIDATES = 10  # 测速候选节点数上限
 
 _KEEP_PROC = []  # 防止 Popen 对象被回收；子进程在脚本退出后继续运行
 
@@ -302,30 +302,82 @@ def parse_nodes(links: list) -> list:
 # ---------- xray 启动与节点实测 ----------
 
 
-def build_config(outbound: dict) -> dict:
+def build_config(outbound: dict, socks_port: int) -> dict:
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [
-            {"tag": "socks-in", "listen": "127.0.0.1", "port": SOCKS_PORT, "protocol": "socks", "settings": {"udp": True}},
-            {"tag": "http-in", "listen": "127.0.0.1", "port": HTTP_PORT, "protocol": "http", "settings": {}},
+            {"tag": "socks-in", "listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": True}},
+            {"tag": "http-in", "listen": "127.0.0.1", "port": socks_port + 1, "protocol": "http", "settings": {}},
         ],
         "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
     }
 
 
-def wait_port(timeout: float = 10) -> bool:
+def start_xray(outbound: dict, socks_port: int, xray_path: str):
+    """写配置并启动 xray，返回 Popen（失败返回 None）"""
+    config_path = os.path.abspath("xray_config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(build_config(outbound, socks_port), f, ensure_ascii=False, indent=2)
+    try:
+        proc = subprocess.Popen(
+            [xray_path, "run", "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"⚠️ xray 启动异常: {e}")
+        return None
+    _KEEP_PROC.append(proc)
+    return proc
+
+
+def stop_xray(proc) -> None:
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def wait_port(port: int, timeout: float = 10) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", SOCKS_PORT), timeout=1):
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
                 return True
         except OSError:
             time.sleep(0.3)
     return False
 
 
-def test_node() -> tuple:
-    """节点连通性测试
+def probe_latency(socks_port: int, timeout: int = 10) -> float | None:
+    """测速：通过节点请求 https://connect.linux.do（OAuth 网关，链路关键域名）的总耗时
+
+    Returns:
+        耗时秒数；连接失败（含 TLS 证书错误）返回 None
+    """
+    from curl_cffi import requests as curl_requests
+
+    start = time.monotonic()
+    try:
+        curl_requests.get(
+            "https://connect.linux.do",
+            proxy=f"socks5://127.0.0.1:{socks_port}",
+            timeout=timeout,
+            impersonate="chrome136",
+        )
+        return time.monotonic() - start
+    except Exception:
+        return None
+
+
+def test_node(socks_port: int) -> tuple:
+    """节点完整连通性验证（对测速胜出的节点执行）
 
     对 linux.do 与 connect.linux.do（OAuth 网关，独立证书）只要求 TLS 握手成功
     （任何 HTTP 状态码均可）：数据中心出口 IP 被 Cloudflare 返回 403/质询页是正常
@@ -339,7 +391,7 @@ def test_node() -> tuple:
     for host in ("linux.do", "connect.linux.do"):
         try:
             curl_requests.get(
-                f"https://{host}", proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
+                f"https://{host}", proxy=f"socks5://127.0.0.1:{socks_port}", timeout=20, impersonate="chrome136"
             )
         except Exception as e:
             return False, f"{host} TLS 失败: {type(e).__name__}: {str(e)[:100]}"
@@ -347,7 +399,7 @@ def test_node() -> tuple:
     try:
         resp = curl_requests.get(
             "https://api.ipify.org",
-            proxy=f"socks5://127.0.0.1:{SOCKS_PORT}",
+            proxy=f"socks5://127.0.0.1:{socks_port}",
             timeout=20,
             impersonate="chrome136",
         )
@@ -386,42 +438,60 @@ def main() -> int:
         return 1
 
     random.shuffle(nodes)
+    candidates = nodes[:MAX_CANDIDATES]
 
-    for node in nodes[:MAX_CANDIDATES]:
-        print(f"ℹ️ 尝试节点: {node['name']}")
-        config_path = os.path.abspath("xray_config.json")
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(build_config(node["outbound"]), f, ensure_ascii=False, indent=2)
-
-        proc = subprocess.Popen(
-            [xray_path, "run", "-c", config_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        _KEEP_PROC.append(proc)
-
-        if not wait_port():
-            print(f"⚠️ 节点 {node['name']}: xray 启动失败")
-            proc.terminate()
+    # ---- 阶段一：逐节点测速（通过节点访问 connect.linux.do 的耗时作为指标） ----
+    print(f"🏃 开始节点测速（{len(candidates)} 个候选，指标：connect.linux.do 请求耗时）")
+    scored = []  # (延迟秒数, node)
+    total = len(candidates)
+    for i, node in enumerate(candidates, 1):
+        # 每个候选使用独立端口，测完即停，避免端口占用冲突
+        probe_port = SOCKS_PORT + 100 + i * 10
+        proc = start_xray(node["outbound"], probe_port, xray_path)
+        if proc is None:
+            print(f"  [{i}/{total}] {node['name']}: xray 启动失败")
             continue
+        if not wait_port(probe_port, timeout=8):
+            print(f"  [{i}/{total}] {node['name']}: xray 启动超时")
+            stop_xray(proc)
+            continue
+        latency = probe_latency(probe_port)
+        stop_xray(proc)
+        if latency is None:
+            print(f"  [{i}/{total}] {node['name']}: 连通性测试失败")
+            continue
+        print(f"  [{i}/{total}] {node['name']}: {latency:.2f}s")
+        scored.append((latency, node))
 
+    if not scored:
+        print(f"❌ 已尝试 {total} 个节点均不可用")
+        return 1
+
+    scored.sort(key=lambda x: x[0])
+    print("📊 测速排名（前 5）:")
+    for rank, (latency, node) in enumerate(scored[:5], 1):
+        print(f"  {rank}. {node['name']} — {latency:.2f}s")
+
+    # ---- 阶段二：延迟最低的节点依次完整验证并启动，第一个通过的即选定 ----
+    for latency, node in scored[:3]:
+        proc = start_xray(node["outbound"], SOCKS_PORT, xray_path)
+        if proc is None or not wait_port(SOCKS_PORT, timeout=8):
+            stop_xray(proc)
+            print(f"⚠️ 节点 {node['name']}: 启动失败，尝试下一个")
+            continue
         try:
-            ok, exit_ip = test_node()
+            ok, detail = test_node(SOCKS_PORT)
         except Exception as e:
-            print(f"⚠️ 节点 {node['name']}: 连通性测试失败 - {type(e).__name__}: {str(e)[:120]}")
-            proc.terminate()
-            continue
-
+            ok, detail = False, f"{type(e).__name__}: {str(e)[:100]}"
         if ok:
-            print(f"✅ 已选择节点: {node['name']}（出口 IP: {exit_ip}）")
-            print(f"✅ 本地代理已就绪: socks5://127.0.0.1:{SOCKS_PORT} / http://127.0.0.1:{HTTP_PORT}")
+            print(f"✅ 已选择最快节点: {node['name']}（延迟 {latency:.2f}s，出口 IP: {detail}）")
+            print(f"✅ 本地代理已就绪: socks5://127.0.0.1:{SOCKS_PORT} / http://127.0.0.1:{SOCKS_PORT + 1}")
             set_github_output("proxy", f"socks5://127.0.0.1:{SOCKS_PORT}")
             return 0
+        stop_xray(proc)
+        print(f"⚠️ 节点 {node['name']}: 完整验证未通过（{detail}），尝试下一个")
 
-        print(f"⚠️ 节点 {node['name']}: 连通性测试未通过，尝试下一个节点")
-        proc.terminate()
-
-    print(f"❌ 已尝试 {min(len(nodes), MAX_CANDIDATES)} 个节点均不可用")
+    print("❌ 测速胜出的节点均未通过完整验证")
     return 1
 
 
