@@ -376,6 +376,28 @@ def probe_latency(socks_port: int, timeout: int = 10) -> float | None:
         return None
 
 
+def probe_challenge_reachable(socks_port: int, timeout: int = 10) -> bool:
+    """验证 Cloudflare 质询组件域名经节点可达
+
+    Cloudflare 全屏质询页的验证组件从 challenges.cloudflare.com 加载；
+    实测部分节点（尤其数据中心 IP 段）该域名加载不出，导致质询页永远
+    无法通过（Cloudflare iframes not found 的根因）。延迟最低的节点
+    往往正是这类节点，因此测速必须先验证质询可达性再比延迟。
+    """
+    from curl_cffi import requests as curl_requests
+
+    try:
+        resp = curl_requests.get(
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/scripts/jsd/main.js",
+            proxy=f"socks5://127.0.0.1:{socks_port}",
+            timeout=timeout,
+            impersonate="chrome136",
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def test_node(socks_port: int) -> tuple:
     """节点完整连通性验证（对测速胜出的节点执行）
 
@@ -440,8 +462,8 @@ def main() -> int:
     random.shuffle(nodes)
     candidates = nodes[:MAX_CANDIDATES]
 
-    # ---- 阶段一：逐节点测速（通过节点访问 connect.linux.do 的耗时作为指标） ----
-    print(f"🏃 开始节点测速（{len(candidates)} 个候选，指标：connect.linux.do 请求耗时）")
+    # ---- 阶段一：逐节点测速（质询组件可达为硬性门槛，connect.linux.do 耗时为速度指标） ----
+    print(f"🏃 开始节点测速（{len(candidates)} 个候选，指标：connect.linux.do 耗时 + 质询组件可达）")
     scored = []  # (延迟秒数, node)
     total = len(candidates)
     for i, node in enumerate(candidates, 1):
@@ -456,11 +478,17 @@ def main() -> int:
             stop_xray(proc)
             continue
         latency = probe_latency(probe_port)
-        stop_xray(proc)
         if latency is None:
             print(f"  [{i}/{total}] {node['name']}: 连通性测试失败")
+            stop_xray(proc)
             continue
-        print(f"  [{i}/{total}] {node['name']}: {latency:.2f}s")
+        # Cloudflare 质询组件不可达的节点直接淘汰（质询永远过不了，延迟再低也没用）
+        if not probe_challenge_reachable(probe_port):
+            print(f"  [{i}/{total}] {node['name']}: {latency:.2f}s 但质询组件不可达，淘汰")
+            stop_xray(proc)
+            continue
+        print(f"  [{i}/{total}] {node['name']}: {latency:.2f}s（质询组件可达）")
+        stop_xray(proc)
         scored.append((latency, node))
 
     if not scored:
