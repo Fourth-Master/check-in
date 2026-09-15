@@ -64,6 +64,48 @@ def fetch_subscription(url: str) -> list:
     return links
 
 
+def fetch_subscriptions(raw: str) -> list:
+    """下载一个或多个订阅并合并节点链接
+
+    多个订阅地址之间用换行、逗号或空白分隔（Secret 中可多行填写）。
+    单个订阅失败不影响其他订阅（打印警告后继续）；全部失败时报错退出。
+
+    Returns:
+        合并去重后的节点链接列表
+    """
+    urls = [u.strip() for u in re.split(r"[\n\r,;\s]+", raw.strip()) if u.strip()]
+    if not urls:
+        raise ValueError("V2RAY_SUBSCRIPTION 为空")
+
+    all_links = []
+    failed = []
+    for i, url in enumerate(urls, 1):
+        if len(urls) > 1:
+            print(f"📥 下载订阅 {i}/{len(urls)}: {url[:60]}{'...' if len(url) > 60 else ''}")
+        try:
+            links = fetch_subscription(url)
+            all_links.extend(links)
+            print(f"   ✅ {len(links)} 个节点")
+        except Exception as e:
+            failed.append(url)
+            print(f"   ⚠️ 订阅失败: {type(e).__name__}: {str(e)[:100]}")
+
+    if not all_links:
+        raise ValueError(f"全部 {len(urls)} 个订阅均下载失败")
+
+    if failed:
+        print(f"⚠️ {len(failed)}/{len(urls)} 个订阅失败，继续使用其余订阅的节点")
+
+    # 去重（同一节点出现在多个订阅中时）
+    seen = set()
+    unique_links = []
+    for link in all_links:
+        if link not in seen:
+            seen.add(link)
+            unique_links.append(link)
+    return unique_links
+
+
 # ---------- 节点解析 ----------
 
 
@@ -449,9 +491,9 @@ def main() -> int:
         print("❌ V2RAY_SUBSCRIPTION 未配置")
         return 1
 
-    links = fetch_subscription(subscription)
+    links = fetch_subscriptions(subscription)
     nodes = parse_nodes(links)
-    print(f"ℹ️ 订阅解析到 {len(nodes)} 个节点")
+    print(f"ℹ️ 共解析到 {len(nodes)} 个节点")
     if node_filter:
         nodes = [n for n in nodes if re.search(node_filter, n["name"])]
         print(f"ℹ️ 按过滤条件 \"{node_filter}\" 匹配到 {len(nodes)} 个节点")
