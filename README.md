@@ -306,7 +306,9 @@ linux.do 登录即可使用 GitHub 方式，无需其他配置。
 
 - 启用后 `PROXY` 自动指向本地代理（无需再配置 `PROXY` secret）；仍需 `LINUXDO_PROXY=true`
   让 linux.do 流量走代理，或账号设置 `"proxy": true`
-- 每次运行随机选择节点，最多尝试 5 个，全部实测连通后才使用；日志会打印所选节点与出口 IP
+- **每次运行自动测速选最快节点**：逐节点实测访问 `connect.linux.do` 的耗时并排名，
+  延迟最低的节点再经完整连通性验证（linux.do 与 connect.linux.do TLS + 出口 IP）后启用，
+  日志会打印全部节点的测速排名
 - 支持 vmess / vless / trojan / shadowsocks 节点（tcp/ws/grpc/h2、tls/reality）
 - 仅支持在 GitHub Actions 中使用（本地运行需自行安装 xray 并设置 `XRAY_PATH`）
 
