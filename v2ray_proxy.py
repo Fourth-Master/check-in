@@ -327,19 +327,22 @@ def wait_port(timeout: float = 10) -> bool:
 def test_node() -> tuple:
     """节点连通性测试
 
-    对 linux.do 只要求 TLS 握手成功（任何 HTTP 状态码均可）：数据中心出口 IP 被
-    Cloudflare 返回 403/质询页是正常现象，浏览器流程本身会处理质询；真正要排除的
-    是 TLS 证书错误（SSL_ERROR_BAD_CERT_DOMAIN）与完全连不通的坏节点。
+    对 linux.do 与 connect.linux.do（OAuth 网关，独立证书）只要求 TLS 握手成功
+    （任何 HTTP 状态码均可）：数据中心出口 IP 被 Cloudflare 返回 403/质询页是正常
+    现象，浏览器流程本身会处理质询；真正要排除的是 TLS 证书错误
+    （SSL_ERROR_BAD_CERT_DOMAIN，节点侧 DNS 污染/SNI 劫持的标志）与完全连不通的
+    坏节点。实测有节点 linux.do 主域正常但 connect.linux.do 证书不匹配。
     出口 IP 查询必须返回 200。
     """
     from curl_cffi import requests as curl_requests
 
-    try:
-        curl_requests.get(
-            "https://linux.do", proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
-        )
-    except Exception as e:
-        return False, f"linux.do TLS 失败: {type(e).__name__}: {str(e)[:100]}"
+    for host in ("linux.do", "connect.linux.do"):
+        try:
+            curl_requests.get(
+                f"https://{host}", proxy=f"socks5://127.0.0.1:{SOCKS_PORT}", timeout=20, impersonate="chrome136"
+            )
+        except Exception as e:
+            return False, f"{host} TLS 失败: {type(e).__name__}: {str(e)[:100]}"
 
     try:
         resp = curl_requests.get(
