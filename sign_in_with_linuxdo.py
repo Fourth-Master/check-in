@@ -393,7 +393,13 @@ class LinuxDoSignIn:
                                                 f"当前页面: {page.url}"
                                             )
                                         else:
-                                            await page.wait_for_timeout(3000)
+                                            # 刷新页面重新发起 SSO 跳转，获取全新的质询实例
+                                            # （质询 iframe 渲染失败常为偶发，新质询往往可正常渲染）
+                                            print(f"ℹ️ {self.account_name}: 刷新页面重新尝试 SSO 跳转")
+                                            try:
+                                                await page.reload(wait_until="domcontentloaded")
+                                            except Exception:
+                                                await page.wait_for_timeout(3000)
                             else:
                                 # 检查是否出现授权按钮（表示已登录）
                                 allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
