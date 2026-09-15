@@ -301,7 +301,8 @@ linux.do 登录即可使用 GitHub 方式，无需其他配置。
 
 在 Settings -> Environments -> production -> Environment secrets 中添加：
    - Name: `V2RAY_SUBSCRIPTION`
-   - Value: v2ray 订阅地址
+   - Value: v2ray 订阅地址，**支持多个**（换行、逗号或空格分隔，全部下载后合并节点池统一测速选优；
+     单个订阅失败不影响其他订阅）
    可选：Name: `V2RAY_NODE_FILTER`，Value: 节点名称过滤（正则，如 `香港|HK|日本|JP`）
 
 - 启用后 `PROXY` 自动指向本地代理（无需再配置 `PROXY` secret）；仍需 `LINUXDO_PROXY=true`
