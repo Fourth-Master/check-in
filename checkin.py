@@ -1507,37 +1507,62 @@ class CheckIn:
                         print(f"ℹ️ {self.account_name}: 使用 OAuth 浏览器指纹更新 headers")
                         updated_headers.update(oauth_browser_headers)
 
-                    response = session.get(callback_url, headers=updated_headers, timeout=30)
+                    # provider 服务端可能出现瞬时故障（如 failed to connect to Linux DO server，
+                    # 即 newapi 服务器临时连不上 connect.linux.do），此时 OAuth code 尚未被消费，
+                    # 重试同一回调有机会成功
+                    json_data = None
+                    for _cb_attempt in (1, 2, 3):
+                        response = session.get(callback_url, headers=updated_headers, timeout=30)
 
-                    if response.status_code == 200:
+                        if response.status_code != 200:
+                            if 500 <= response.status_code < 600 and _cb_attempt < 3:
+                                print(
+                                    f"⚠️ {self.account_name}: 回调 HTTP {response.status_code}，"
+                                    f"5 秒后重试（{_cb_attempt}/3）"
+                                )
+                                await asyncio.sleep(5)
+                                continue
+                            print(f"❌ {self.account_name}: OAuth 回调 HTTP {response.status_code}")
+                            return False, {"error": f"OAuth 回调 HTTP {response.status_code}"}
+
                         json_data = response_resolve(response, "linuxdo_oauth_callback", self.account_name)
                         if json_data and json_data.get("success"):
-                            user_data = json_data.get("data", {})
-                            api_user = user_data.get("id")
+                            break
 
-                            if api_user:
-                                print(f"✅ {self.account_name}: 已从回调获取 api_user: {api_user}")
+                        error_msg = json_data.get("message", "未知错误") if json_data else "响应无效"
+                        if "failed to connect" in str(error_msg).lower() and _cb_attempt < 3:
+                            print(
+                                f"⚠️ {self.account_name}: 回调返回「{error_msg}」，"
+                                f"5 秒后重试（{_cb_attempt}/3）"
+                            )
+                            await asyncio.sleep(5)
+                            continue
+                        print(f"❌ {self.account_name}: OAuth 回调失败：{error_msg}")
+                        return False, {"error": f"OAuth 回调失败：{error_msg}"}
 
-                                # 提取 cookies
-                                user_cookies = {}
-                                for cookie in response.cookies.jar:
-                                    user_cookies[cookie.name] = cookie.value
+                    if not (json_data and json_data.get("success")):
+                        print(f"❌ {self.account_name}: OAuth 回调重试均未成功")
+                        return False, {"error": "OAuth 回调重试均未成功"}
 
-                                print(
-                                    f"ℹ️ {self.account_name}: 提取到 {len(user_cookies)} 个用户 Cookie: {list(user_cookies.keys())}"
-                                )
-                                merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
-                                return await self.check_in_with_cookies(merged_cookies, updated_headers, api_user, impersonate)
-                            else:
-                                print(f"❌ {self.account_name}: 回调响应中没有用户 ID")
-                                return False, {"error": "OAuth 回调响应中没有用户 ID"}
-                        else:
-                            error_msg = json_data.get("message", "未知错误") if json_data else "响应无效"
-                            print(f"❌ {self.account_name}: OAuth 回调失败：{error_msg}")
-                            return False, {"error": f"OAuth 回调失败：{error_msg}"}
+                    user_data = json_data.get("data", {})
+                    api_user = user_data.get("id")
+
+                    if api_user:
+                        print(f"✅ {self.account_name}: 已从回调获取 api_user: {api_user}")
+
+                        # 提取 cookies
+                        user_cookies = {}
+                        for cookie in response.cookies.jar:
+                            user_cookies[cookie.name] = cookie.value
+
+                        print(
+                            f"ℹ️ {self.account_name}: 提取到 {len(user_cookies)} 个用户 Cookie: {list(user_cookies.keys())}"
+                        )
+                        merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
+                        return await self.check_in_with_cookies(merged_cookies, updated_headers, api_user, impersonate)
                     else:
-                        print(f"❌ {self.account_name}: OAuth 回调 HTTP {response.status_code}")
-                        return False, {"error": f"OAuth 回调 HTTP {response.status_code}"}
+                        print(f"❌ {self.account_name}: 回调响应中没有用户 ID")
+                        return False, {"error": "OAuth 回调响应中没有用户 ID"}
                 except Exception as callback_err:
                     print(f"❌ {self.account_name}: 调用 OAuth 回调时发生错误：{callback_err}")
                     return False, {"error": f"OAuth 回调错误：{callback_err}"}
