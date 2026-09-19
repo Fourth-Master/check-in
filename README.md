@@ -270,11 +270,14 @@ linux.do 会对 GitHub Actions 等数据中心 IP 进行限流（登录页返回
 linux.do 的 Cloudflare 防护会对数据中心 IP（包括常见代理出口）弹出人机验证，
 账号密码登录可能被静默拦截。登录方式的自动优先级如下：
 
-1. **Actions 会话缓存**：上次成功登录后的会话（缓存有效期内直接复用）
-2. **预置会话**（`STORATE_STATES_LINUXDO`，可选）：你自己浏览器导出的会话
-3. **GitHub 登录**（推荐配置）：点击 linux.do 登录页的 "Log in with GitHub"，
+1. **站点会话缓存**（`storage-states/site_*.json`）：OAuth 成功后自动保存签到站点的
+   会话 Cookie 与 api_user，下次运行**直接复用签到，完全跳过 linux.do/GitHub 登录**；
+   只在会话失效（站点返回 401 等）时才重新走登录流程。会话随 Actions 缓存持久化，无需手动维护
+2. **Actions 会话缓存**：上次成功登录后的 linux.do/GitHub 浏览器会话（缓存有效期内直接复用）
+3. **预置会话**（`STORATE_STATES_LINUXDO`，可选）：你自己浏览器导出的会话
+4. **GitHub 登录**（推荐配置）：点击 linux.do 登录页的 "Log in with GitHub"，
    复用 `ACCOUNTS_GITHUB` 中的账号凭据与 GitHub 会话缓存，全自动化、不依赖手动导出
-4. **账号密码登录**：以上均失败时的最后回退（数据中心/代理环境下大概率被拦截）
+5. **账号密码登录**：以上均失败时的最后回退（数据中心/代理环境下大概率被拦截）
 
 配置了 `ACCOUNTS_GITHUB`（即使该账号没有配置 `"github": true` 的签到项），
 linux.do 登录即可使用 GitHub 方式，无需其他配置。
