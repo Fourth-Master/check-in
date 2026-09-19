@@ -9,6 +9,7 @@ import inspect
 import hashlib
 import os
 import tempfile
+from datetime import datetime
 from urllib.parse import urlparse, urlencode
 
 from curl_cffi import requests as curl_requests
@@ -86,6 +87,94 @@ class CheckIn:
             if name in self.WAF_COOKIE_NAMES or name not in merged:
                 merged[name] = value
         return merged
+
+    # ---- 站点会话缓存：OAuth 成功后的站点 session（如 anyrouter.top 的 session）
+    # 有效期通常远长于 linux.do/GitHub 授权流程，缓存后下次运行直接复用，
+    # 避免每次运行都触发 linux.do Cloudflare 质询与 GitHub 2FA ----
+
+    def _site_session_path(self, auth_type: str, username_hash: str) -> str:
+        """站点会话缓存文件路径（存放在 storage-states 目录，随 Actions 缓存持久化）"""
+        return f"{self.storage_state_dir}/site_{self.provider_config.name}_{auth_type}_{username_hash}.json"
+
+    def _load_site_session(self, auth_type: str, username_hash: str) -> dict | None:
+        """读取站点会话缓存，无缓存或格式不完整时返回 None"""
+        path = self._site_session_path(auth_type, username_hash)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"⚠️ {self.account_name}: 读取站点会话缓存失败: {e}")
+            return None
+        if not data.get("cookies") or not data.get("api_user"):
+            return None
+        return data
+
+    def _save_site_session(
+        self,
+        auth_type: str,
+        username_hash: str,
+        cookies: dict,
+        api_user: str | int,
+        browser_headers: dict | None = None,
+    ) -> None:
+        """保存站点会话缓存（OAuth 成功后调用）"""
+        if not cookies or not api_user:
+            return
+        try:
+            os.makedirs(self.storage_state_dir, exist_ok=True)
+            path = self._site_session_path(auth_type, username_hash)
+            data = {
+                "cookies": cookies,
+                "api_user": api_user,
+                "browser_headers": browser_headers or {},
+                "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"✅ {self.account_name}: 站点会话已缓存（下次运行将优先复用，无需重新登录）")
+        except Exception as e:
+            print(f"⚠️ {self.account_name}: 保存站点会话缓存失败: {e}")
+
+    async def _try_cached_site_session(
+        self,
+        auth_type: str,
+        username_hash: str,
+        bypass_cookies: dict,
+        common_headers: dict,
+    ) -> tuple[bool, dict] | None:
+        """尝试用缓存的站点会话直接签到
+
+        Returns:
+            (成功标志, 结果) ；无缓存时返回 None（调用方继续 OAuth 流程）
+        """
+        cached = self._load_site_session(auth_type, username_hash)
+        if not cached:
+            return None
+
+        print(
+            f"ℹ️ {self.account_name}: 发现站点会话缓存（保存于 {cached.get('saved_at', '未知')}），"
+            "尝试直接签到（免登录）"
+        )
+        cached_headers = common_headers.copy()
+        if cached.get("browser_headers"):
+            cached_headers.update(cached["browser_headers"])
+        cached_cookies = self.merge_cookies(bypass_cookies, cached["cookies"])
+        try:
+            ok, info = await self.check_in_with_cookies(cached_cookies, cached_headers, cached["api_user"])
+        except Exception as e:
+            ok, info = False, {"error": f"缓存会话签到异常：{e}"}
+
+        if ok:
+            print(f"✅ {self.account_name}: 站点会话有效，本次无需重新登录")
+            return ok, info
+
+        print(
+            f"⚠️ {self.account_name}: 站点会话已失效"
+            f"（{info.get('error', '未知原因')}），重新走 {auth_type} 登录"
+        )
+        return None
 
     async def get_waf_cookies_with_browser(self) -> dict | None:
         """使用 Camoufox 获取 WAF cookies（隐私模式）"""
@@ -1247,6 +1336,13 @@ class CheckIn:
             username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
             cache_file_path = f"{self.storage_state_dir}/github_{username_hash}_storage_state.json"
 
+            # 优先复用站点会话缓存（避免每次运行都触发 GitHub 登录/2FA）
+            cached_result = await self._try_cached_site_session(
+                "github", username_hash, bypass_cookies, common_headers
+            )
+            if cached_result is not None:
+                return cached_result
+
             from sign_in_with_github import GitHubSignIn
 
             github = GitHubSignIn(
@@ -1276,6 +1372,9 @@ class CheckIn:
                 # 统一调用 check_in_with_cookies 执行签到
                 user_cookies = result_data["cookies"]
                 api_user = result_data["api_user"]
+
+                # 缓存站点会话，下次运行直接复用（免 GitHub 登录）
+                self._save_site_session("github", username_hash, user_cookies, api_user, oauth_browser_headers)
 
                 # 如果 OAuth 登录返回了 browser_headers，用它更新 common_headers
                 updated_headers = common_headers.copy()
@@ -1323,6 +1422,10 @@ class CheckIn:
 
                                 print(
                                     f"ℹ️ {self.account_name}: 提取到 {len(user_cookies)} 个用户 Cookie: {list(user_cookies.keys())}"
+                                )
+                                # 缓存站点会话，下次运行直接复用（免 GitHub 登录）
+                                self._save_site_session(
+                                    "github", username_hash, user_cookies, api_user, oauth_browser_headers
                                 )
                                 merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
                                 return await self.check_in_with_cookies(merged_cookies, updated_headers, api_user, impersonate)
@@ -1439,6 +1542,13 @@ class CheckIn:
             username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
             cache_file_path = f"{self.storage_state_dir}/linuxdo_{username_hash}_storage_state.json"
 
+            # 优先复用站点会话缓存（避免每次运行都触发 linux.do 登录）
+            cached_result = await self._try_cached_site_session(
+                "linuxdo", username_hash, bypass_cookies, common_headers
+            )
+            if cached_result is not None:
+                return cached_result
+
             from sign_in_with_linuxdo import LinuxDoSignIn
 
             # linux.do 登录页支持 GitHub OAuth：复用全局 GitHub 账号
@@ -1478,6 +1588,11 @@ class CheckIn:
                 # 统一调用 check_in_with_cookies 执行签到
                 user_cookies = result_data["cookies"]
                 api_user = result_data["api_user"]
+
+                # 缓存站点会话，下次运行直接复用（免 Linux.do 登录）
+                self._save_site_session(
+                    "linuxdo", username_hash, user_cookies, api_user, oauth_browser_headers
+                )
 
                 # 如果 OAuth 登录返回了 browser_headers，用它更新 common_headers
                 updated_headers = common_headers.copy()
@@ -1557,6 +1672,10 @@ class CheckIn:
 
                         print(
                             f"ℹ️ {self.account_name}: 提取到 {len(user_cookies)} 个用户 Cookie: {list(user_cookies.keys())}"
+                        )
+                        # 缓存站点会话，下次运行直接复用（免 Linux.do 登录）
+                        self._save_site_session(
+                            "linuxdo", username_hash, user_cookies, api_user, oauth_browser_headers
                         )
                         merged_cookies = self.merge_cookies(bypass_cookies, user_cookies)
                         return await self.check_in_with_cookies(merged_cookies, updated_headers, api_user, impersonate)
