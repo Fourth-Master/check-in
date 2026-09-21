@@ -16,6 +16,27 @@ from utils.storage_state import ensure_storage_state_from_env
 
 STORAGE_STATE_ENV_NAME = "STORATE_STATES_GITHUB"
 
+# GitHub 授权页（/login/oauth/authorize）的「Authorize」按钮。
+# 该页表单里的第一个 submit 按钮是「Cancel」（name="authorize" value="0"），
+# 用通用的 button[type="submit"] 会点到「Cancel」= 拒绝授权，GitHub 随即回调
+# error=access_denied（应用被 GitHub 停用才会返回 application_suspended，
+# 所以出现 access_denied 就说明是授权页上真的被拒了）。
+GITHUB_AUTHORIZE_BUTTON = 'button[name="authorize"][value="1"], button.js-oauth-authorize-btn'
+
+
+async def find_authorize_button(page):
+    """查找 GitHub 授权页的「Authorize」按钮，找不到或不可见时返回 None
+
+    已授权过的应用会跳过授权页直接跳回，因此找不到按钮未必是异常。
+    """
+    try:
+        btn = await page.query_selector(GITHUB_AUTHORIZE_BUTTON)
+        if btn and await btn.is_visible():
+            return btn
+    except Exception:
+        pass  # 跳转进行中查询会抛 Execution context destroyed，忽略
+    return None
+
 
 class GitHubSignIn:
     """使用 GitHub 登录授权类"""
@@ -128,13 +149,16 @@ class GitHubSignIn:
                                 )
                             else:
                                 # 检查是否出现授权按钮（表示已登录）
-                                authorize_btn = await page.query_selector('button[type="submit"]')
+                                authorize_btn = await find_authorize_button(page)
                                 if authorize_btn:
                                     is_logged_in = True
                                     print(
                                         f"✅ {self.account_name}: 已通过缓存登录，继续进行授权"
                                     )
-                                    await authorize_btn.click()
+                                    try:
+                                        await authorize_btn.click()
+                                    except Exception as click_err:
+                                        print(f"⚠️ {self.account_name}: 点击授权按钮失败: {click_err}")
                                 else:
                                     print(f"ℹ️ {self.account_name}: 未找到授权按钮，需要重新登录")
                         except Exception as e:
@@ -282,12 +306,15 @@ class GitHubSignIn:
                                 print(f"✅ {self.account_name}: 已登录，继续进行授权")
                             else:
                                 # 检查是否出现授权按钮（表示已登录）
-                                authorize_btn = await page.query_selector('button[type="submit"]')
+                                authorize_btn = await find_authorize_button(page)
                                 if authorize_btn:
                                     print(
                                         f"✅ {self.account_name}: 已通过缓存登录，继续进行授权"
                                     )
-                                    await authorize_btn.click()
+                                    try:
+                                        await authorize_btn.click()
+                                    except Exception as click_err:
+                                        print(f"⚠️ {self.account_name}: 点击授权按钮失败: {click_err}")
                                 else:
                                     print(f"ℹ️ {self.account_name}: 未找到授权按钮")
                         except Exception as e:
@@ -399,6 +426,22 @@ class GitHubSignIn:
                                     f"ℹ️ {self.account_name}: 未返回浏览器指纹头部（未检测到 Cloudflare 验证）"
                                 )
                             return True, query_params, browser_headers
+                        elif "error" in query_params:
+                            # 回调带 error 说明授权被 GitHub 侧拒绝，最常见的是 access_denied
+                            # （授权页上点了 Cancel，或该账号始终未批准此应用）
+                            error_code = (query_params.get("error") or [""])[0]
+                            error_desc = (query_params.get("error_description") or [""])[0]
+                            print(
+                                f"❌ {self.account_name}: GitHub 拒绝授权: {error_code} - {error_desc}\n"
+                                f"解析的 URL 为: {current_url}"
+                            )
+                            return (
+                                False,
+                                {
+                                    "error": f"GitHub 拒绝授权（{error_code}）",
+                                },
+                                None,
+                            )
                         else:
                             print(
                                 f"❌ {self.account_name}: OAuth 失败，回调中无 code\n"

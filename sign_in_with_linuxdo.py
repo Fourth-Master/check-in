@@ -16,6 +16,55 @@ from utils.storage_state import ensure_storage_state_from_env
 
 STORAGE_STATE_ENV_NAME = "STORATE_STATES_LINUXDO"
 
+# GitHub 授权页（/login/oauth/authorize）的「Authorize」按钮，与 sign_in_with_github.py 同一处坑：
+# 该页表单里第一个 submit 按钮是「Cancel」（name="authorize" value="0"），
+# 用 button[type=submit] 会点到拒绝，GitHub 随即回调 error=access_denied
+GITHUB_AUTHORIZE_BUTTON = 'button[name="authorize"][value="1"], button.js-oauth-authorize-btn'
+
+# Cloudflare 按出口 IP 下发的 Cookie，换节点后复用会持续触发全屏质询
+CF_IP_BOUND_COOKIE_PREFIXES = ("cf_clearance", "__cf_bm", "_cfuvid", "cf_chl_", "__cfwaitingroom")
+
+
+def load_storage_state_without_cf_cookies(path: str, account_name: str) -> dict | None:
+    """读取 linux.do 会话缓存，剔除与出口 IP 绑定的 Cloudflare Cookie
+
+    cf_clearance / __cf_bm / _cfuvid 由 Cloudflare 按出口 IP 下发，而代理节点每次运行
+    都可能不同：复用旧 IP 的 cf_clearance 会被判为无效，Cloudflare 会持续弹全屏质询，
+    而质询组件常常加载不出来（日志表现为 Cloudflare iframes not found），登录永远走不完。
+    linux.do 的登录态由 _t / _forum_session 等 Cookie 维持，剔除这些不影响会话复用。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception as e:
+        print(f"⚠️ {account_name}: 读取会话缓存失败: {e}")
+        return None
+
+    kept, dropped = [], []
+    for cookie in state.get("cookies") or []:
+        name = (cookie.get("name") or "").lower()
+        if name.startswith(CF_IP_BOUND_COOKIE_PREFIXES):
+            dropped.append(cookie.get("name"))
+        else:
+            kept.append(cookie)
+    state["cookies"] = kept
+    if dropped:
+        print(
+            f"ℹ️ {account_name}: 已剔除 {len(dropped)} 个与出口 IP 绑定的 Cloudflare Cookie"
+            f"（{', '.join(dropped)}）"
+        )
+    return state
+
+
+async def is_cloudflare_challenge(page) -> bool:
+    """当前页面是否为 Cloudflare 全屏质询页（质询页无法访问页面内容）"""
+    try:
+        title = await page.title()
+        content = await page.content()
+    except Exception:
+        return False
+    return "Just a moment" in title or "Checking your browser" in content
+
 
 class LinuxDoSignIn:
     """使用 Linux.do 登录授权类"""
@@ -98,6 +147,9 @@ class LinuxDoSignIn:
                     print(f"✅ {self.account_name}: Cloudflare 质询已自动解决")
                 except Exception as solve_err:
                     print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
+                    await save_page_content_to_file(
+                        page, f"login_page_cf_round{_cf_round + 1}", self.account_name, prefix="linuxdo"
+                    )
                 try:
                     await page.wait_for_selector("button.btn-social.github", state="visible", timeout=30000)
                     break
@@ -121,7 +173,13 @@ class LinuxDoSignIn:
                         pass
                 await page.wait_for_timeout(3000)
             if not github_btn:
-                print(f"⚠️ {self.account_name}: 未找到 GitHub 登录按钮")
+                if await is_cloudflare_challenge(page):
+                    print(
+                        f"⚠️ {self.account_name}: 未找到 GitHub 登录按钮"
+                        f"（页面仍停留在 Cloudflare 质询，当前: {page.url}）"
+                    )
+                else:
+                    print(f"⚠️ {self.account_name}: 未找到 GitHub 登录按钮")
                 return False
             try:
                 await github_btn.click()
@@ -208,7 +266,7 @@ class LinuxDoSignIn:
                     print(f"✅ {self.account_name}: 已通过 GitHub 登录 linux.do")
                     return True
                 if "github.com" in url:
-                    authorize_btn = await _safe_query("#js-oauth-authorize-btn, button[type=submit]")
+                    authorize_btn = await _safe_query(GITHUB_AUTHORIZE_BUTTON)
                     if authorize_btn:
                         try:
                             if await authorize_btn.is_visible():
@@ -275,9 +333,10 @@ class LinuxDoSignIn:
             )
             
             # 只有在缓存文件存在时才加载 storage_state
-            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
-            if storage_state:
+            storage_state = None
+            if os.path.exists(cache_file_path):
                 print(f"ℹ️ {self.account_name}: 找到缓存文件，恢复会话缓存")
+                storage_state = load_storage_state_without_cf_cookies(cache_file_path, self.account_name)
             else:
                 print(f"ℹ️ {self.account_name}: 未找到缓存文件，将全新开始")
 
@@ -349,6 +408,29 @@ class LinuxDoSignIn:
                             if final_url != (response.url if response else ""):
                                 print(f"ℹ️ {self.account_name}: 重定向链完成后页面为 {final_url}")
                             await save_page_content_to_file(page, "sign_in_check", self.account_name, prefix="linuxdo")
+
+                            # 质询页会停在 authorize URL 上：既没有 approve 链接，也不会跳回应用。
+                            # 不区分的话会直接判定「会话过期」，白白走上必然失败的重新登录流程
+                            if not final_url.startswith(self.provider_config.origin) and (
+                                await is_cloudflare_challenge(page)
+                            ):
+                                print(f"ℹ️ {self.account_name}: 登录状态检查遇到 Cloudflare 质询，正在自动解决...")
+                                try:
+                                    await solver.solve_captcha(
+                                        captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
+                                    )
+                                    print(f"✅ {self.account_name}: Cloudflare 质询已自动解决")
+                                except Exception as solve_err:
+                                    print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
+                                await _wait_redirect_settle(20)
+                                final_url = page.url
+                                if not final_url.startswith(self.provider_config.origin) and (
+                                    await is_cloudflare_challenge(page)
+                                ):
+                                    print(f"⚠️ {self.account_name}: 质询未通过，当前页面: {final_url}")
+                                    await save_page_content_to_file(
+                                        page, "session_check_cf_stuck", self.account_name, prefix="linuxdo"
+                                    )
 
                             # 登录后可能直接跳转回应用页面
                             if final_url.startswith(self.provider_config.origin):
@@ -497,6 +579,18 @@ class LinuxDoSignIn:
                                 try:
                                     await page.wait_for_selector("#login-button", state="visible", timeout=15000)
                                 except Exception:
+                                    # 质询未通过时登录表单永远不会出现，继续往下填表单只会耗到
+                                    # Page.fill 超时并报出与该原因无关的错误，这里提前给出结论
+                                    if await is_cloudflare_challenge(page):
+                                        print(
+                                            f"❌ {self.account_name}: linux.do 登录页仍停留在 Cloudflare 质询，"
+                                            f"无法进入登录表单（代理出口 IP 可能被拦截）\n"
+                                            f"当前页面: {page.url}"
+                                        )
+                                        await save_page_content_to_file(
+                                            page, "login_cf_stuck", self.account_name, prefix="linuxdo"
+                                        )
+                                        return False, {"error": "linux.do 登录页被 Cloudflare 质询拦截"}, None
                                     print(f"⚠️ {self.account_name}: 等待登录按钮超时，继续尝试")
 
                                 # 监听登录相关响应（/session 为 Ember XHR，POST /login 为免 JS 原生表单提交）
