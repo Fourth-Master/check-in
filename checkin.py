@@ -696,9 +696,16 @@ class CheckIn:
                         "success": False,
                         "error": f"获取授权状态失败：{error_msg}",
                     }
+            # 非 200 时带上响应体片段：站点边缘（Cloudflare/WAF）拦截会返回 502 等
+            # 状态码，体里通常写明拦截原因，没有这段就只能看到状态码无从判断
+            detail = ""
+            try:
+                detail = " ".join((response.text or "").split())[:200]
+            except Exception:
+                pass
             return {
                 "success": False,
-                "error": f"获取授权状态失败：HTTP {response.status_code}",
+                "error": f"获取授权状态失败：HTTP {response.status_code}" + (f"，响应: {detail}" if detail else ""),
             }
         except Exception as e:
             return {
