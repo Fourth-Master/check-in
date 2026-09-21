@@ -590,7 +590,15 @@ class LinuxDoSignIn:
                                         await save_page_content_to_file(
                                             page, "login_cf_stuck", self.account_name, prefix="linuxdo"
                                         )
-                                        return False, {"error": "linux.do 登录页被 Cloudflare 质询拦截"}, None
+                                        # cf_blocked 供调用方判断是否改用直连重试
+                                        return (
+                                            False,
+                                            {
+                                                "error": "linux.do 登录页被 Cloudflare 质询拦截",
+                                                "cf_blocked": True,
+                                            },
+                                            None,
+                                        )
                                     print(f"⚠️ {self.account_name}: 等待登录按钮超时，继续尝试")
 
                                 # 监听登录相关响应（/session 为 Ember XHR，POST /login 为免 JS 原生表单提交）

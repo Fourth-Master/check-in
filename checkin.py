@@ -1583,6 +1583,35 @@ class CheckIn:
                 print(f"❌ {self.account_name}: Linux.do 登录授权总超时（12 分钟），放弃本账号")
                 return False, {"error": "Linux.do 登录授权总超时"}
 
+            # 代理出口 IP 被 Cloudflare 判定为高风险时，全屏 managed challenge 的验证组件
+            # 永远渲染不出来（日志为 Cloudflare iframes not found），重试多少次都过不去；
+            # 改用直连（runner 自身出口）再试一次，避开被拉黑的代理 IP
+            if not success and result_data.get("cf_blocked") and self.get_linuxdo_proxy():
+                print(f"ℹ️ {self.account_name}: 代理出口被 Cloudflare 质询拦截，改为直连重试一次")
+                linuxdo_direct = LinuxDoSignIn(
+                    account_name=self.account_name,
+                    provider_config=self.provider_config,
+                    username=username,
+                    password=password,
+                    proxy=None,
+                    github_username=github_account.username if github_account else None,
+                    github_password=github_account.password if github_account else None,
+                    storage_state_dir=self.storage_state_dir,
+                )
+                try:
+                    success, result_data, oauth_browser_headers = await asyncio.wait_for(
+                        linuxdo_direct.signin(
+                            client_id=client_id_result["client_id"],
+                            auth_state=auth_state_result["state"],
+                            auth_cookies=auth_state_result.get("cookies", []),
+                            cache_file_path=cache_file_path,
+                        ),
+                        timeout=720,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"❌ {self.account_name}: 直连重试也超时，放弃本账号")
+                    return False, {"error": "Linux.do 登录授权总超时（直连重试）"}
+
             # 检查是否成功获取 cookies 和 api_user
             if success and "cookies" in result_data and "api_user" in result_data:
                 # 统一调用 check_in_with_cookies 执行签到
