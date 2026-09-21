@@ -440,6 +440,34 @@ def probe_challenge_reachable(socks_port: int, timeout: int = 10) -> bool:
         return False
 
 
+def probe_linuxdo_challenged(socks_port: int, timeout: int = 15) -> bool | None:
+    """探测 linux.do 登录页经该节点是否被 Cloudflare 全屏质询
+
+    出口 IP 被 Cloudflare 判定为高风险时，linux.do/login 会返回 managed challenge，
+    而验证组件在浏览器里往往渲染不出来（日志表现为 Cloudflare iframes not found），
+    linux.do 登录永远走不完 —— 这种节点即使延迟最低也不能选。
+    返回 True=被质询，False=未被质询，None=探测失败（结果未知）。
+    """
+    from curl_cffi import requests as curl_requests
+
+    try:
+        resp = curl_requests.get(
+            "https://linux.do/login",
+            proxy=f"socks5://127.0.0.1:{socks_port}",
+            timeout=timeout,
+            impersonate="chrome136",
+        )
+    except Exception:
+        return None
+
+    body = resp.text or ""
+    # 只认全屏质询页特有的标记：正常登录页本身也带 Turnstile 组件（challenges.cloudflare.com/turnstile），
+    # 用通用标记会把所有节点都误判为被质询
+    if any(marker in body for marker in ("Just a moment", "cf_chl_opt", "_cf_chl_")):
+        return True
+    return resp.status_code != 200
+
+
 def test_node(socks_port: int) -> tuple:
     """节点完整连通性验证（对测速胜出的节点执行）
 
@@ -504,9 +532,9 @@ def main() -> int:
     random.shuffle(nodes)
     candidates = nodes[:MAX_CANDIDATES]
 
-    # ---- 阶段一：逐节点测速（质询组件可达为硬性门槛，connect.linux.do 耗时为速度指标） ----
-    print(f"🏃 开始节点测速（{len(candidates)} 个候选，指标：connect.linux.do 耗时 + 质询组件可达）")
-    scored = []  # (延迟秒数, node)
+    # ---- 阶段一：逐节点测速（质询组件可达为硬性门槛，linux.do 未被质询者优先，延迟为次要指标） ----
+    print(f"🏃 开始节点测速（{len(candidates)} 个候选，指标：linux.do 是否被质询 + connect.linux.do 耗时）")
+    scored = []  # (质询优先级, 延迟秒数, node)
     total = len(candidates)
     for i, node in enumerate(candidates, 1):
         # 每个候选使用独立端口，测完即停，避免端口占用冲突
@@ -529,21 +557,33 @@ def main() -> int:
             print(f"  [{i}/{total}] {node['name']}: {latency:.2f}s 但质询组件不可达，淘汰")
             stop_xray(proc)
             continue
-        print(f"  [{i}/{total}] {node['name']}: {latency:.2f}s（质询组件可达）")
+        # 被 Cloudflare 质询的节点排到最后：直连 runner IP 会被 linux.do 429 限流，
+        # 只能靠代理节点，而被质询的节点上 linux.do 登录永远走不完
+        challenged = probe_linuxdo_challenged(probe_port)
+        if challenged is True:
+            priority, note = 2, "linux.do 被质询"
+        elif challenged is None:
+            priority, note = 1, "linux.do 探测失败"
+        else:
+            priority, note = 0, "linux.do 未质询"
+        print(f"  [{i}/{total}] {node['name']}: {latency:.2f}s（质询组件可达，{note}）")
         stop_xray(proc)
-        scored.append((latency, node))
+        scored.append((priority, latency, node))
 
     if not scored:
         print(f"❌ 已尝试 {total} 个节点均不可用")
         return 1
 
-    scored.sort(key=lambda x: x[0])
+    if all(priority > 0 for priority, _, _ in scored):
+        print("⚠️ 没有节点能正常访问 linux.do 登录页（均被质询或探测失败）：linux.do 登录大概率失败")
+    scored.sort(key=lambda x: (x[0], x[1]))
     print("📊 测速排名（前 5）:")
-    for rank, (latency, node) in enumerate(scored[:5], 1):
-        print(f"  {rank}. {node['name']} — {latency:.2f}s")
+    for rank, (priority, latency, node) in enumerate(scored[:5], 1):
+        note = ("linux.do 未质询", "linux.do 探测失败", "linux.do 被质询")[priority]
+        print(f"  {rank}. {node['name']} — {latency:.2f}s（{note}）")
 
-    # ---- 阶段二：延迟最低的节点依次完整验证并启动，第一个通过的即选定 ----
-    for latency, node in scored[:3]:
+    # ---- 阶段二：优先级最高、延迟最低的节点依次完整验证并启动，第一个通过的即选定 ----
+    for priority, latency, node in scored[:3]:
         proc = start_xray(node["outbound"], SOCKS_PORT, xray_path)
         if proc is None or not wait_port(SOCKS_PORT, timeout=8):
             stop_xray(proc)
