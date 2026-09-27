@@ -1800,13 +1800,30 @@ class CheckIn:
                 print(f"❌ {self.account_name}: 站点登录失败 - {error_msg}")
                 return False, {"error": error_msg}
 
-            user_data = json_data.get("data", {})
-            api_user = user_data.get("id")
-            if api_user is None:
-                # 站点改版后登录响应可能不再直接带 id（精简字段、或要求二次验证）。
-                # 只要登录确实拿到了 session cookie，就用它读 /api/user/self 取 id
-                print(f"⚠️ {self.account_name}: 站点登录响应中没有用户 ID，尝试用登录 Cookie 读取用户信息")
-                print(f"ℹ️ {self.account_name}: 登录响应: {json.dumps(json_data, ensure_ascii=False)[:300]}")
+            data = json_data.get("data") or {}
+            # 只打印字段名：值会被日志脱敏（token/cookie），字段结构才是排查所需
+            print(f"ℹ️ {self.account_name}: 登录响应字段: {list(json_data.keys())} / data: {list(data.keys())}")
+            api_user = data.get("id")
+            if api_user is None and isinstance(data.get("user"), dict):
+                api_user = data["user"].get("id")
+            # 新版 new-api 登录返回 JWT：access_token + access_expires_at，不再带用户 id，
+            # 后续 API（含签到）都要带 Authorization: Bearer，光有 cookie 会 401
+            access_token = data.get("access_token")
+            if access_token:
+                print(f"ℹ️ {self.account_name}: 登录响应为新版 access_token 鉴权")
+            if api_user is None and access_token:
+                info_headers = headers.copy()
+                info_headers.pop("Content-Type", None)
+                info_headers["Authorization"] = f"Bearer {access_token}"
+                info = session.get(self.provider_config.get_user_info_url(), headers=info_headers, timeout=30)
+                if info.status_code == 200:
+                    info_json = response_resolve(info, "site_user_self", self.account_name)
+                    if info_json and info_json.get("success"):
+                        api_user = ((info_json.get("data") or {}).get("id"))
+                        if api_user is not None:
+                            print(f"✅ {self.account_name}: 已用 access_token 获取 api user: {api_user}")
+            if api_user is None and not access_token:
+                # 没有 token 的旧接口：登录可能只给了 session cookie，用它读用户信息兜底
                 login_cookies = {cookie.name: cookie.value for cookie in session.cookies.jar}
                 print(f"ℹ️ {self.account_name}: 登录响应 Cookie: {list(login_cookies.keys())}")
                 if login_cookies:
@@ -1816,12 +1833,18 @@ class CheckIn:
                     if info.status_code == 200:
                         info_json = response_resolve(info, "site_user_self", self.account_name)
                         if info_json and info_json.get("success"):
-                            api_user = (info_json.get("data") or {}).get("id")
+                            api_user = ((info_json.get("data") or {}).get("id"))
                             if api_user is not None:
                                 print(f"✅ {self.account_name}: 已从用户信息 API 获取 api user: {api_user}")
-                if api_user is None:
-                    print(f"❌ {self.account_name}: 站点登录响应中没有用户 ID")
-                    return False, {"error": "站点登录响应中没有用户 ID"}
+            if api_user is None:
+                print(f"❌ {self.account_name}: 站点登录响应中没有用户 ID")
+                return False, {"error": "站点登录响应中没有用户 ID"}
+
+            if access_token:
+                # 新版鉴权下 cookie 不足，必须走 Bearer 令牌路径签到
+                return await self.check_in_with_system_access_token(
+                    access_token, bypass_cookies, common_headers, api_user
+                )
 
             user_cookies = {}
             for cookie in session.cookies.jar:
