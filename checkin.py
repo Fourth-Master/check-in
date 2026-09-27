@@ -1803,8 +1803,25 @@ class CheckIn:
             user_data = json_data.get("data", {})
             api_user = user_data.get("id")
             if api_user is None:
-                print(f"❌ {self.account_name}: 站点登录响应中没有用户 ID")
-                return False, {"error": "站点登录响应中没有用户 ID"}
+                # 站点改版后登录响应可能不再直接带 id（精简字段、或要求二次验证）。
+                # 只要登录确实拿到了 session cookie，就用它读 /api/user/self 取 id
+                print(f"⚠️ {self.account_name}: 站点登录响应中没有用户 ID，尝试用登录 Cookie 读取用户信息")
+                print(f"ℹ️ {self.account_name}: 登录响应: {json.dumps(json_data, ensure_ascii=False)[:300]}")
+                login_cookies = {cookie.name: cookie.value for cookie in session.cookies.jar}
+                print(f"ℹ️ {self.account_name}: 登录响应 Cookie: {list(login_cookies.keys())}")
+                if login_cookies:
+                    info_headers = headers.copy()
+                    info_headers.pop("Content-Type", None)
+                    info = session.get(self.provider_config.get_user_info_url(), headers=info_headers, timeout=30)
+                    if info.status_code == 200:
+                        info_json = response_resolve(info, "site_user_self", self.account_name)
+                        if info_json and info_json.get("success"):
+                            api_user = (info_json.get("data") or {}).get("id")
+                            if api_user is not None:
+                                print(f"✅ {self.account_name}: 已从用户信息 API 获取 api user: {api_user}")
+                if api_user is None:
+                    print(f"❌ {self.account_name}: 站点登录响应中没有用户 ID")
+                    return False, {"error": "站点登录响应中没有用户 ID"}
 
             user_cookies = {}
             for cookie in session.cookies.jar:
@@ -1911,7 +1928,35 @@ class CheckIn:
         await page.dispatch_event(password_selector, "input")
         await page.dispatch_event(password_selector, "change")
         await page.wait_for_timeout(500)
+
+        # 前端受控表单（React/semi-ui）有时不认 fill 触发的合成事件，字段看着已填但
+        # 校验状态没更新，提交按钮一直是 disabled。此时用真实键盘输入再填一次。
+        if not await self._is_site_login_submit_enabled(page):
+            print(f"⚠️ {self.account_name}: 填表后提交按钮仍不可用，改用键盘输入重填")
+            for selector, value in ((username_selector, username), (password_selector, password)):
+                try:
+                    await page.fill(selector, "")
+                    await page.click(selector)
+                    await page.keyboard.type(value, delay=50)
+                    await page.wait_for_timeout(300)
+                except Exception as e:
+                    print(f"⚠️ {self.account_name}: 键盘重填 {selector} 失败: {e}")
         return True
+
+    async def _is_site_login_submit_enabled(self, page) -> bool:
+        """检查站点登录提交按钮是否可用（受控表单会把它 disabled 到校验通过为止）"""
+        for selector in (
+            'form button[type="submit"]',
+            'button[type="submit"]',
+            "button.semi-button-primary",
+        ):
+            try:
+                element = await page.query_selector(selector)
+                if element and await element.is_enabled():
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def _submit_site_login_form(self, page) -> bool:
         """提交站点登录表单，优先使用表单内 submit 按钮。"""
@@ -1927,17 +1972,28 @@ class CheckIn:
                 element = await page.query_selector(selector)
                 if element:
                     print(f"ℹ️ {self.account_name}: 通过选择器提交站点登录表单：{selector}")
-                    await element.click()
-                    return True
+                    try:
+                        # 超时压到 10 秒：按钮 disabled 时默认 30 秒才失败，白等
+                        await element.click(timeout=10000)
+                        return True
+                    except Exception as click_err:
+                        if not await element.is_enabled():
+                            print(
+                                f"⚠️ {self.account_name}: 提交按钮 {selector} 处于 disabled 状态"
+                                "（前端校验未通过），换下一个选择器"
+                            )
+                        else:
+                            print(f"⚠️ {self.account_name}: 点击 {selector} 失败: {click_err}")
             except Exception as e:
-                print(f"⚠️ {self.account_name}: 提交选择器 {selector} 失败: {e}")
+                print(f"⚠️ {self.account_name}: 提交选择器 {selector} 查询失败: {e}")
 
         try:
             submitted = await page.evaluate(
                 """() => {
                     const buttons = Array.from(document.querySelectorAll('button'));
                     const button = buttons.find((item) => {
-                        const text = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
+                        if (item.disabled) return false;
+                        const text = (item.innerText || item.textContent || '').replace(/\\s+/g, ' ').trim();
                         return text.includes('继续') || text.includes('登录') || text.includes('登入');
                     });
                     if (button) {

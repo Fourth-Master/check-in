@@ -322,8 +322,10 @@ def parse_ss(link: str):
 
 def parse_nodes(links: list) -> list:
     nodes = []
+    skipped = {}
     for link in links:
         try:
+            scheme = link.split("://", 1)[0] if "://" in link else "unknown"
             if link.startswith("vmess://"):
                 node = parse_vmess(link)
             elif link.startswith("vless://"):
@@ -333,11 +335,18 @@ def parse_nodes(links: list) -> list:
             elif link.startswith("ss://"):
                 node = parse_ss(link)
             else:
+                skipped[f"不支持的协议 {scheme}"] = skipped.get(f"不支持的协议 {scheme}", 0) + 1
                 continue
             if node and node["outbound"]["settings"]:
                 nodes.append(node)
+            else:
+                skipped[f"{scheme} 解析为空"] = skipped.get(f"{scheme} 解析为空", 0) + 1
         except Exception as e:
             print(f"⚠️ 节点解析失败: {link[:40]}... ({e})")
+    # 订阅里常有 xray 不支持的协议（hysteria2 / tuic / ssr），解析数远少于链接数时
+    # 这条统计能直接说明原因，避免误以为是订阅挂了
+    if skipped:
+        print("ℹ️ 跳过的节点: " + "，".join(f"{k} {v} 个" for k, v in skipped.items()))
     return nodes
 
 

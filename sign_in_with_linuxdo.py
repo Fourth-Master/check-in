@@ -57,13 +57,26 @@ def load_storage_state_without_cf_cookies(path: str, account_name: str) -> dict 
 
 
 async def is_cloudflare_challenge(page) -> bool:
-    """当前页面是否为 Cloudflare 全屏质询页（质询页无法访问页面内容）"""
+    """当前页面是否为 Cloudflare 质询页或拦截页
+
+    质询页（Just a moment…）与拦截页（Attention Required / Sorry, you have been blocked）
+    都拿不到站点内容，也无法用解题库点击通过，处理方式相同：先尝试解题，仍不行就
+    交回上层走直连重试或报明确错误。
+    """
     try:
         title = await page.title()
         content = await page.content()
     except Exception:
         return False
-    return "Just a moment" in title or "Checking your browser" in content
+    markers = (
+        "Just a moment",
+        "Checking your browser",
+        "Attention Required",
+        "Sorry, you have been blocked",
+        "cf_chl_opt",
+        "_cf_chl_",
+    )
+    return any(marker in title or marker in content for marker in markers)
 
 
 class LinuxDoSignIn:
