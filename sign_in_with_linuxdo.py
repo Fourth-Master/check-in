@@ -79,6 +79,15 @@ async def is_cloudflare_challenge(page) -> bool:
     return any(marker in title or marker in content for marker in markers)
 
 
+async def is_rate_limited(page) -> bool:
+    """当前页面是否为 linux.do 的 429 限流页（直连 runner 出口时的典型表现）"""
+    try:
+        content = await page.content()
+    except Exception:
+        return False
+    return "Too Many Requests" in content
+
+
 class LinuxDoSignIn:
     """使用 Linux.do 登录授权类"""
 
@@ -389,6 +398,9 @@ class LinuxDoSignIn:
                 try:
                     # 检查是否已经登录（通过缓存恢复）
                     is_logged_in = False
+                    # SSO 链路（connect.linux.do → linux.do/session/sso_provider）被 Cloudflare
+                    # 拦住时置位，供后面判断是否该改用直连重试（代理出口 IP 常被拦）
+                    sso_chain_blocked = False
                     oauth_url = (
                         f"https://connect.linux.do/oauth2/authorize?"
                         f"response_type=code&client_id={client_id}&state={auth_state}"
@@ -462,8 +474,7 @@ class LinuxDoSignIn:
                                 # 先自动解决质询再等授权按钮
                                 for _sso_wait_round in range(3):
                                     try:
-                                        _title = await page.title()
-                                        if "Just a moment" in _title or "Checking your browser" in (await page.content()):
+                                        if await is_cloudflare_challenge(page):
                                             print(
                                                 f"ℹ️ {self.account_name}: SSO 跳转遇到 Cloudflare 质询，"
                                                 f"正在自动解决（第 {_sso_wait_round + 1}/3 轮）..."
@@ -476,6 +487,10 @@ class LinuxDoSignIn:
                                                 print(f"✅ {self.account_name}: Cloudflare 质询已自动解决")
                                             except Exception as solve_err:
                                                 print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
+                                        elif await is_rate_limited(page):
+                                            # 直连 runner 出口时 linux.do 会返回 429，走代理则多为质询
+                                            print(f"⚠️ {self.account_name}: SSO 跳转被 linux.do 限流（429）")
+                                            sso_chain_blocked = True
                                         await page.wait_for_selector(
                                             'a[href^="/oauth2/approve"], input[type="submit"]',
                                             timeout=20000,
@@ -495,6 +510,8 @@ class LinuxDoSignIn:
                                                 await page.reload(wait_until="domcontentloaded")
                                             except Exception:
                                                 await page.wait_for_timeout(3000)
+                                if await is_cloudflare_challenge(page):
+                                    sso_chain_blocked = True
                             else:
                                 # 检查是否出现授权按钮（表示已登录）
                                 allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
@@ -843,6 +860,20 @@ class LinuxDoSignIn:
                             f"当前页面: {page.url}"
                         )
                         await take_screenshot(page, "authorization_failed_bypass", self.account_name)
+                        # 质询/限流造成的失败带上 cf_blocked，交回上层改用直连重试一次
+                        if (
+                            sso_chain_blocked
+                            or await is_cloudflare_challenge(page)
+                            or await is_rate_limited(page)
+                        ):
+                            return (
+                                False,
+                                {
+                                    "error": "linux.do SSO 链路被 Cloudflare 拦截或限流",
+                                    "cf_blocked": True,
+                                },
+                                None,
+                            )
                         return False, {"error": "Linux.do 授权失败"}, None
 
                     # 统一处理授权逻辑（无论是否通过缓存登录）
