@@ -54,6 +54,11 @@ class CheckIn:
 
         self.global_proxy = global_proxy
 
+        # 绕过用 Cookie 的共享引用：阿里云 WAF Cookie 是「遇到拦截才现取」，
+        # 取到后需要立刻让后续所有请求（授权状态/登录/签到）都带上，故存放在 self 上
+        self._bypass_cookies: dict = {}
+        self._aliyun_captcha_cookies: dict | None = None
+
         # 账号代理默认不启用：proxy=true 时使用全局 PROXY，dict 为自定义代理，未配置则不走代理
         resolved_proxy = resolve_account_proxy(account_config)
         if global_proxy and not resolved_proxy:
@@ -408,6 +413,29 @@ class CheckIn:
                 finally:
                     await page.close()
 
+    async def ensure_aliyun_bypass_cookies(self, reason: str) -> dict:
+        """按需获取阿里云 WAF 验证 Cookie，并共享给后续所有请求
+
+        站点的阿里云 WAF 会拦下 curl_cffi 请求并返回验证页 HTML（页面里含
+        CF_APP_WAF/traceid）。此时用浏览器打开登录页让 WAF 脚本跑完，拿到
+        acw_tc/acw_sc__v2 等 Cookie 后带上重试即可通过。一个账号只取一次。
+        """
+        if self._aliyun_captcha_cookies is not None:
+            return self._aliyun_captcha_cookies
+
+        print(f"ℹ️ {self.account_name}: {reason}，启动浏览器获取阿里云验证 Cookie")
+        try:
+            cookies = await self.get_aliyun_captcha_cookies_with_browser()
+        except Exception as e:
+            print(f"⚠️ {self.account_name}: 获取阿里云验证 Cookie 失败: {e}")
+            cookies = None
+
+        self._aliyun_captcha_cookies = cookies or {}
+        if self._aliyun_captcha_cookies:
+            # 直接更新共享字典：调用方的 bypass_cookies 与这里是同一个对象
+            self._bypass_cookies.update(self._aliyun_captcha_cookies)
+        return self._aliyun_captcha_cookies
+
     async def get_status_with_browser(self) -> dict | None:
         """使用 Camoufox 获取状态信息并缓存
         Returns:
@@ -638,6 +666,19 @@ class CheckIn:
 
             if response.status_code == 200:
                 json_data = response_resolve(response, "get_auth_state", self.account_name)
+                if json_data is None:
+                    # 阿里云 WAF 会返回验证页 HTML（含 CF_APP_WAF/traceid），
+                    # 取一次 WAF Cookie 重试即可拿到 JSON
+                    if self.provider_config.aliyun_captcha:
+                        cookies = await self.ensure_aliyun_bypass_cookies("授权状态接口返回 HTML（疑似阿里云 WAF 拦截）")
+                        if cookies:
+                            session.cookies.update(cookies)
+                            response = session.get(
+                                self.provider_config.get_auth_state_url(),
+                                headers=headers,
+                                timeout=30,
+                            )
+                            json_data = response_resolve(response, "get_auth_state_retry", self.account_name)
                 if json_data is None:
                     return {
                         "success": False,
@@ -1792,6 +1833,13 @@ class CheckIn:
                 return False, {"error": f"站点登录 HTTP {response.status_code}"}
 
             json_data = response_resolve(response, "site_login", self.account_name)
+            if json_data is None and self.provider_config.aliyun_captcha:
+                # 阿里云 WAF 会拦下登录请求并返回验证页 HTML，取 WAF Cookie 后重试一次
+                cookies = await self.ensure_aliyun_bypass_cookies("站点登录接口返回 HTML（疑似阿里云 WAF 拦截）")
+                if cookies:
+                    session.cookies.update(cookies)
+                    response = session.post(login_url, headers=headers, json=payload, timeout=30)
+                    json_data = response_resolve(response, "site_login_retry", self.account_name)
             if json_data is None:
                 return False, {"error": "站点登录返回无效响应"}
 
@@ -2215,6 +2263,9 @@ class CheckIn:
                 print(f"⚠️ {self.account_name}: 将继续使用空 Cookie")
         else:
             print(f"ℹ️ {self.account_name}: 无需绕过，直接使用用户 Cookie")
+
+        # 让「遇到阿里云 WAF 再取 Cookie」这一步能把结果写回这里，后续请求自动带上
+        self._bypass_cookies = bypass_cookies
 
         # 生成公用请求头（只生成一次 User-Agent，整个签到流程保持一致）
         # 注意：Referer 和 Origin 不在这里设置，由各个签到方法根据实际请求动态设置

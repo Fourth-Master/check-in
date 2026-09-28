@@ -3,8 +3,10 @@
 响应处理工具函数
 """
 
+import base64
 import json
 import os
+import re
 from datetime import datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
@@ -68,6 +70,35 @@ def proxy_resolve(proxy_config: dict | None = None) -> str | None:
     return proxy_url
 
 
+def redact_credentials_in_text(text: str) -> str:
+    """脱敏文本里可能包含账号密码的 base64 片段
+
+    WAF 拦截页（阿里云 CF_APP_WAF 等）会把被拦下的请求体原样回显在页面里，
+    而站点登录的请求体正是 {"username": ..., "password": ...} 的 base64。
+    这类页面会被保存进 logs/ 并作为 Actions artifact 上传，等于把账号密码
+    一起交出去，因此保存前先把这些片段替换掉。
+    """
+    def _looks_like_credentials(decoded: str) -> bool:
+        lowered = decoded.lower()
+        return ("password" in lowered or "passwd" in lowered or '"pwd"' in lowered) and (
+            "username" in lowered or "user" in lowered or "email" in lowered
+        )
+
+    def _replace(match: re.Match) -> str:
+        blob = match.group(0)
+        try:
+            padded = blob + "=" * (-len(blob) % 4)
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+        except Exception:
+            return blob
+        if _looks_like_credentials(decoded):
+            return "[REDACTED_BASE64]"
+        return blob
+
+    # base64 片段至少 24 字符，避免误伤普通文本/路径
+    return re.sub(r"[A-Za-z0-9+/]{24,}={0,2}", _replace, text)
+
+
 def response_resolve(
     response: curl_requests.Response,
     context: str,
@@ -97,13 +128,15 @@ def response_resolve(
         safe_context = "".join(c if c.isalnum() else "_" for c in context)
 
         content_type = response.headers.get("content-type", "").lower()
+        # 保存前脱敏：WAF 页面常回显请求体（含站点账号密码的 base64）
+        body = redact_credentials_in_text(response.text)
 
         if "text/html" in content_type or "text/plain" in content_type:
             filename = f"{safe_account_name}_{timestamp}_{safe_context}.html"
             filepath = os.path.join(logs_dir, filename)
 
             with open(filepath, "w", encoding="utf-8") as f:
-                f.write(response.text)
+                f.write(body)
 
             print(f"⚠️ {account_name}: 收到 HTML 响应，已保存到: {filepath}")
         else:
@@ -111,7 +144,7 @@ def response_resolve(
             filepath = os.path.join(logs_dir, filename)
 
             with open(filepath, "w", encoding="utf-8") as f:
-                f.write(response.text)
+                f.write(body)
 
             print(f"⚠️ {account_name}: 无效响应已保存到: {filepath}")
         return None
