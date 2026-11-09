@@ -3,6 +3,7 @@
 浏览器自动化相关的公共工具函数
 """
 
+import math
 import os
 import random
 from datetime import datetime
@@ -230,13 +231,13 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
                 await page.wait_for_selector("#nocaptcha", timeout=60000)
 
                 slider_element = await page.query_selector("#nocaptcha .nc_scale")
-                if slider_element:
-                    slider = await slider_element.bounding_box()
+                slider = await slider_element.bounding_box() if slider_element else None
+                if slider:
                     print(f"ℹ️ {account_name}: 滑块边界框: {slider}")
 
                 slider_handle = await page.query_selector("#nocaptcha .btn_slide")
-                if slider_handle:
-                    handle = await slider_handle.bounding_box()
+                handle = await slider_handle.bounding_box() if slider_handle else None
+                if handle:
                     print(f"ℹ️ {account_name}: 滑块手柄边界框: {handle}")
 
                 if slider and handle:
@@ -247,11 +248,20 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
                         handle.get("y") + handle.get("height") / 2,
                     )
                     await page.mouse.down()
-                    await page.mouse.move(
-                        handle.get("x") + slider.get("width"),
-                        handle.get("y") + handle.get("height") / 2,
-                        steps=2,
-                    )
+                    # 拟人轨迹：先快后慢、带纵向抖动，避免被判定为脚本直线拖动
+                    start_x = handle.get("x") + handle.get("width") / 2
+                    end_x = handle.get("x") + slider.get("width")
+                    y = handle.get("y") + handle.get("height") / 2
+                    distance = end_x - start_x
+                    steps = random.randint(25, 40)
+
+                    for i in range(1, steps + 1):
+                        progress = i / steps
+                        # ease-out：前半段快、后半段慢
+                        eased = 1 - (1 - progress) ** 2
+                        jitter_y = random.uniform(-2, 2) * math.sin(progress * math.pi)
+                        await page.mouse.move(start_x + distance * eased, y + jitter_y)
+                        await page.wait_for_timeout(random.randint(8, 25))
                     await page.mouse.up()
                     await take_screenshot(page, "aliyun_captcha_slider_completed", account_name)
 

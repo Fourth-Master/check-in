@@ -3,9 +3,12 @@
 使用 Camoufox 绕过 Cloudflare 验证执行 Linux.do 签到
 """
 
+import asyncio
 import hashlib
 import json
 import os
+import random
+import time
 from urllib.parse import urlparse, parse_qs
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
@@ -15,6 +18,24 @@ from utils.get_headers import get_browser_headers, print_browser_headers
 from utils.storage_state import ensure_storage_state_from_env
 
 STORAGE_STATE_ENV_NAME = "STORATE_STATES_LINUXDO"
+
+# 同一 linux.do 账号被多个 provider 复用时，背靠背访问 OAuth 链路会触发
+# linux.do 的 429 限流（SSO 跳转一直停在限流页直到超时）。记录上一次
+# OAuth 访问开始时间，两次访问之间强制拉开间隔。
+_LINUXDO_OAUTH_MIN_INTERVAL_S = 90
+_last_linuxdo_oauth_ts: float | None = None
+
+
+async def _respect_linuxdo_rate_limit(account_name: str) -> None:
+    """两次 linux.do OAuth 访问之间强制拉开间隔，避免 429 限流"""
+    global _last_linuxdo_oauth_ts
+    if _last_linuxdo_oauth_ts is not None:
+        elapsed = time.monotonic() - _last_linuxdo_oauth_ts
+        if elapsed < _LINUXDO_OAUTH_MIN_INTERVAL_S:
+            wait_s = _LINUXDO_OAUTH_MIN_INTERVAL_S - elapsed + random.uniform(2, 6)
+            print(f"⏳ {account_name}: 与上一次 linux.do OAuth 访问间隔过短，等待 {wait_s:.0f}s 防止 429 限流")
+            await asyncio.sleep(wait_s)
+    _last_linuxdo_oauth_ts = time.monotonic()
 
 # GitHub 授权页（/login/oauth/authorize）的「Authorize」按钮，与 sign_in_with_github.py 同一处坑：
 # 该页表单里第一个 submit 按钮是「Cancel」（name="authorize" value="0"），
@@ -408,6 +429,8 @@ class LinuxDoSignIn:
 
                     if os.path.exists(cache_file_path):
                         try:
+                            # 同一 linux.do 账号被多个 provider 依次使用时，避免 429 限流
+                            await _respect_linuxdo_rate_limit(self.account_name)
                             print(f"ℹ️ {self.account_name}: 正在检查 {oauth_url} 的登录状态")
                             # 直接访问授权页面检查是否已登录
                             response = await page.goto(oauth_url, wait_until="domcontentloaded")
@@ -471,13 +494,13 @@ class LinuxDoSignIn:
                                 )
                                 # SSO 链路（connect.linux.do）可能再次弹出 Cloudflare 质询
                                 # （预置会话的 cf_clearance 与当前代理出口 IP 不匹配），
-                                # 先自动解决质询再等授权按钮
-                                for _sso_wait_round in range(3):
+                                # 先自动解决质询再等授权按钮；429 限流页则退避等待后刷新
+                                for _sso_wait_round in range(5):
                                     try:
                                         if await is_cloudflare_challenge(page):
                                             print(
                                                 f"ℹ️ {self.account_name}: SSO 跳转遇到 Cloudflare 质询，"
-                                                f"正在自动解决（第 {_sso_wait_round + 1}/3 轮）..."
+                                                f"正在自动解决（第 {_sso_wait_round + 1}/5 轮）..."
                                             )
                                             try:
                                                 await solver.solve_captcha(
@@ -489,15 +512,21 @@ class LinuxDoSignIn:
                                                 print(f"⚠️ {self.account_name}: 自动解决失败: {solve_err}")
                                         elif await is_rate_limited(page):
                                             # 直连 runner 出口时 linux.do 会返回 429，走代理则多为质询
-                                            print(f"⚠️ {self.account_name}: SSO 跳转被 linux.do 限流（429）")
+                                            # 退避等待后刷新重试，立即刷新只会继续 429
+                                            backoff_s = 20 + _sso_wait_round * 15 + random.uniform(0, 10)
+                                            print(
+                                                f"⚠️ {self.account_name}: SSO 跳转被 linux.do 限流（429），"
+                                                f"退避 {backoff_s:.0f}s 后重试（第 {_sso_wait_round + 1}/5 轮）"
+                                            )
                                             sso_chain_blocked = True
+                                            await asyncio.sleep(backoff_s)
                                         await page.wait_for_selector(
                                             'a[href^="/oauth2/approve"], input[type="submit"]',
                                             timeout=20000,
                                         )
                                         break
                                     except Exception:
-                                        if _sso_wait_round == 2:
+                                        if _sso_wait_round == 4:
                                             print(
                                                 f"⚠️ {self.account_name}: 等待授权页面超时，"
                                                 f"当前页面: {page.url}"
@@ -805,19 +834,34 @@ class LinuxDoSignIn:
                                 await take_screenshot(page, "signin_bypass_error", self.account_name)
                                 return False, {"error": "Linux.do 登录出错"}, None
 
-                        # 登录后访问授权页面
-                        try:
-                            print(f"ℹ️ {self.account_name}: 正在前往授权页面: {oauth_url}")
-                            await page.goto(oauth_url, wait_until="domcontentloaded")
-                        except Exception as e:
+                    # 登录后访问授权页面
+                    try:
+                        await _respect_linuxdo_rate_limit(self.account_name)
+                        print(f"ℹ️ {self.account_name}: 正在前往授权页面: {oauth_url}")
+                        await page.goto(oauth_url, wait_until="domcontentloaded")
+                    except Exception as e:
                             print(f"❌ {self.account_name}: 跳转到授权页面失败: {e}")
                             await take_screenshot(page, "auth_page_navigation_failed_bypass", self.account_name)
                             return False, {"error": "Linux.do 授权页面跳转失败"}, None
 
                     try:
-                        # 等待授权按钮出现，最多等待30秒
+                        # 等待授权按钮出现，最多等待30秒；被限流/质询卡住时退避后刷新重试
                         print(f"ℹ️ {self.account_name}: 正在等待授权按钮...")
-                        await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=30000)
+                        try:
+                            await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=30000)
+                        except Exception:
+                            if await is_rate_limited(page) or await is_cloudflare_challenge(page):
+                                backoff_s = 30 + random.uniform(0, 15)
+                                print(
+                                    f"⚠️ {self.account_name}: 等待授权按钮超时且页面被限流/质询卡住，"
+                                    f"退避 {backoff_s:.0f}s 后刷新重试"
+                                )
+                                await asyncio.sleep(backoff_s)
+                                try:
+                                    await page.goto(oauth_url, wait_until="domcontentloaded")
+                                except Exception:
+                                    await page.reload(wait_until="domcontentloaded")
+                                await page.wait_for_selector('a[href^="/oauth2/approve"]', timeout=30000)
                         allow_btn_ele = await page.query_selector('a[href^="/oauth2/approve"]')
 
                         if allow_btn_ele:

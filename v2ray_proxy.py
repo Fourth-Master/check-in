@@ -434,19 +434,31 @@ def probe_challenge_reachable(socks_port: int, timeout: int = 10) -> bool:
     实测部分节点（尤其数据中心 IP 段）该域名加载不出，导致质询页永远
     无法通过（Cloudflare iframes not found 的根因）。延迟最低的节点
     往往正是这类节点，因此测速必须先验证质询可达性再比延迟。
+
+    判定标准：只要拿到任意 HTTP 状态码即视为可达（403/30x 说明
+    DNS+TCP+TLS 链路正常，curl_cffi 被拒不代表浏览器加载不出）；
+    只有连接异常（超时/DNS 失败/TLS 错误）才算不可达。
+    主 URL 失败时再用 turnstile api.js 兜底探测一次。
     """
     from curl_cffi import requests as curl_requests
 
-    try:
-        resp = curl_requests.get(
-            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/scripts/jsd/main.js",
-            proxy=f"socks5://127.0.0.1:{socks_port}",
-            timeout=timeout,
-            impersonate="chrome136",
-        )
-        return resp.status_code == 200
-    except Exception:
-        return False
+    urls = (
+        "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/scripts/jsd/main.js",
+        "https://challenges.cloudflare.com/turnstile/v0/api.js",
+    )
+    for url in urls:
+        try:
+            curl_requests.get(
+                url,
+                proxy=f"socks5://127.0.0.1:{socks_port}",
+                timeout=timeout,
+                impersonate="chrome136",
+            )
+            # 拿到任何 HTTP 响应都算可达
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def probe_linuxdo_challenged(socks_port: int, timeout: int = 15) -> bool | None:

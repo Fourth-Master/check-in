@@ -246,7 +246,12 @@ class CheckIn:
                     await page.close()
 
     async def get_aliyun_captcha_cookies_with_browser(self) -> dict | None:
-        """使用 Camoufox 获取阿里云验证 cookies"""
+        """使用 Camoufox 获取阿里云验证 cookies
+
+        WAF 的 acw_sc__v2 由挑战 JS 计算后写入，首屏加载完可能还没拿到；
+        缺它时刷新页面让 WAF 脚本跑完再收集。同时处理 traceid 验证码页
+        （自动滑块）。
+        """
         print(
             f"ℹ️ {self.account_name}: 启动浏览器获取阿里云验证码 Cookie (使用代理: {'true' if self.camoufox_proxy_config else 'false'})"
         )
@@ -269,132 +274,64 @@ class CheckIn:
                     print(f"ℹ️ {self.account_name}: 访问登录页获取初始 Cookie")
                     await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
 
-                    try:
-                        await page.wait_for_function('document.readyState === "complete"', timeout=5000)
-                    except Exception:
-                        await page.wait_for_timeout(3000)
-
-                        # # 提取验证码相关数据
-                        # captcha_data = await page.evaluate(
-                        #     """() => {
-                        #     const data = {};
-
-                        #     // 获取 traceid
-                        #     const traceElement = document.getElementById('traceid');
-                        #     if (traceElement) {
-                        #         const text = traceElement.innerText || traceElement.textContent;
-                        #         const match = text.match(/TraceID:\\s*([a-f0-9]+)/i);
-                        #         data.traceid = match ? match[1] : null;
-                        #     }
-
-                        #     // 获取 window.aliyun_captcha 相关字段
-                        #     for (const key in window) {
-                        #         if (key.startsWith('aliyun_captcha')) {
-                        #             data[key] = window[key];
-                        #         }
-                        #     }
-
-                        #     // 获取 requestInfo
-                        #     if (window.requestInfo) {
-                        #         data.requestInfo = window.requestInfo;
-                        #     }
-
-                        #     // 获取当前 URL
-                        #     data.currentUrl = window.location.href;
-
-                        #     return data;
-                        # }"""
-                        # )
-
-                        # print(
-                        #     f"📋 {self.account_name}: Captcha data extracted: " f"\n{json.dumps(captcha_data, indent=2)}"
-                        # )
-
-                        # # 通过 WaitForSecrets 发送验证码数据并等待用户手动验证
-                        # from utils.wait_for_secrets import WaitForSecrets
-
-                        # wait_for_secrets = WaitForSecrets()
-                        # secret_obj = {
-                        #     "CAPTCHA_NEXT_URL": {
-                        #         "name": f"{self.account_name} - Aliyun Captcha Verification",
-                        #         "description": (
-                        #             f"Aliyun captcha verification required.\n"
-                        #             f"TraceID: {captcha_data.get('traceid', 'N/A')}\n"
-                        #             f"Current URL: {captcha_data.get('currentUrl', 'N/A')}\n"
-                        #             f"Please complete the captcha manually in the browser, "
-                        #             f"then provide the next URL after verification."
-                        #         ),
-                        #     }
-                        # }
-
-                        # secrets = wait_for_secrets.get(
-                        #     secret_obj,
-                        #     timeout=300,
-                        #     notification={
-                        #         "title": "阿里云验证",
-                        #         "content": "请在浏览器中完成验证，并提供下一步的 URL。\n"
-                        #         f"{json.dumps(captcha_data, indent=2)}\n"
-                        #         "📋 操作说明：https://github.com/aceHubert/newapi-ai-check-in/docs/aliyun_captcha/README.md",
-                        #     },
-                        # )
-                        # if not secrets or "CAPTCHA_NEXT_URL" not in secrets:
-                        #     print(f"❌ {self.account_name}: No next URL provided " f"for captcha verification")
-                        #     return None
-
-                        # next_url = secrets["CAPTCHA_NEXT_URL"]
-                        # print(f"🔄 {self.account_name}: Navigating to next URL " f"after captcha: {next_url}")
-
-                        # # 导航到新的 URL
-                        # await page.goto(next_url, wait_until="networkidle")
-
+                    aliyun_captcha_cookies: dict = {}
+                    max_rounds = 3
+                    for round_no in range(1, max_rounds + 1):
                         try:
                             await page.wait_for_function('document.readyState === "complete"', timeout=5000)
                         except Exception:
                             await page.wait_for_timeout(3000)
 
-                        # 再次检查是否还有 traceid
+                        # 处理 traceid 验证码页（自动滑块验证），无论 readyState 是否超时都要检查
+                        captcha_ok = await aliyun_captcha_check(page, self.account_name)
+                        if not captcha_ok:
+                            print(f"⚠️ {self.account_name}: 阿里云验证码处理失败（第 {round_no}/{max_rounds} 轮）")
+                        await page.wait_for_timeout(3000)
+
+                        cookies = await browser.cookies()
+
+                        aliyun_captcha_cookies = {}
+                        print(f"ℹ️ {self.account_name}: 阿里云验证码 Cookie 列表（第 {round_no}/{max_rounds} 轮）")
+                        for cookie in cookies:
+                            cookie_name = cookie.get("name")
+                            cookie_value = cookie.get("value")
+                            print(f"  📚 Cookie: {cookie_name} (值：{cookie_value})")
+                            if cookie_value is not None:
+                                aliyun_captcha_cookies[cookie_name] = cookie_value
+
+                        # acw_sc__v2 是 WAF 挑战 JS 算出来的关键 Cookie，没有它
+                        # curl 请求依旧会被拦。没拿到就刷新页面再等一轮
+                        if "acw_sc__v2" in aliyun_captcha_cookies:
+                            print(f"✅ {self.account_name}: 已获取完整 WAF Cookie（含 acw_sc__v2）")
+                            break
+                        if round_no < max_rounds:
+                            print(f"⚠️ {self.account_name}: 缺少 acw_sc__v2，刷新页面等待 WAF 挑战完成")
+                            try:
+                                await page.reload(wait_until="networkidle")
+                            except Exception:
+                                await page.wait_for_timeout(5000)
+                            await page.wait_for_timeout(3000)
+
+                    # 页面上仍有 traceid 说明验证码没过，Cookie 大概率无效
+                    traceid_after = None
+                    try:
+                        traceid_after = await page.evaluate(
+                            """() => {
+                            const traceElement = document.getElementById('traceid');
+                            if (traceElement) {
+                                const text = traceElement.innerText || traceElement.textContent;
+                                const match = text.match(/TraceID:\\s*([a-f0-9]+)/i);
+                                return match ? match[1] : null;
+                            }
+                            return null;
+                        }"""
+                        )
+                    except Exception:
                         traceid_after = None
-                        try:
-                            traceid_after = await page.evaluate(
-                                """() => {
-                                const traceElement = document.getElementById('traceid');
-                                if (traceElement) {
-                                    const text = traceElement.innerText || traceElement.textContent;
-                                    const match = text.match(/TraceID:\\s*([a-f0-9]+)/i);
-                                    return match ? match[1] : null;
-                                }
-                                return null;
-                            }"""
-                            )
-                        except Exception:
-                            traceid_after = None
 
-                        if traceid_after:
-                            print(
-                                f"❌ {self.account_name}: 验证码验证失败，"
-                                f"traceid 仍然存在：{traceid_after}"
-                            )
-                            return None
-
-                        print(f"✅ {self.account_name}: 验证码验证成功，" f"traceid 已清除")
-
-                    cookies = await browser.cookies()
-
-                    aliyun_captcha_cookies = {}
-                    print(f"ℹ️ {self.account_name}: 阿里云验证码 Cookie 列表")
-                    for cookie in cookies:
-                        cookie_name = cookie.get("name")
-                        cookie_value = cookie.get("value")
-                        print(f"  📚 Cookie: {cookie_name} (值：{cookie_value})")
-                        # if cookie_name in ["acw_tc", "cdn_sec_tc", "acw_sc__v2"]
-                        # and cookie_value is not None:
-                        aliyun_captcha_cookies[cookie_name] = cookie_value
-
-                    print(
-                        f"ℹ️ {self.account_name}: "
-                        f"第 1 步后获取到 {len(aliyun_captcha_cookies)} 个"
-                        f"阿里云验证码 Cookie"
-                    )
+                    if traceid_after:
+                        print(f"❌ {self.account_name}: 验证码验证失败，traceid 仍然存在：{traceid_after}")
+                        return None
 
                     # 检查是否至少获取到一个 Aliyun Captcha cookie
                     if not aliyun_captcha_cookies:
@@ -435,6 +372,81 @@ class CheckIn:
             # 直接更新共享字典：调用方的 bypass_cookies 与这里是同一个对象
             self._bypass_cookies.update(self._aliyun_captcha_cookies)
         return self._aliyun_captcha_cookies
+
+    async def get_turnstile_token_with_browser(self) -> str | None:
+        """使用 Camoufox 打开登录页，等待 Cloudflare Turnstile 组件自动完成并提取 token
+
+        部分站点（如 hcnsec）的登录接口要求 turnstile 参数，缺少时返回
+        "Turnstile token is empty"。登录页内嵌的 Turnstile 托管组件在真实
+        浏览器里通常会自动通过，通过后从隐藏 input 或 turnstile.getResponse()
+        拿到 token。
+        """
+        print(
+            f"ℹ️ {self.account_name}: 启动浏览器获取 Turnstile token "
+            f"(使用代理: {'true' if self.camoufox_proxy_config else 'false'})"
+        )
+
+        with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_turnstile_") as tmp_dir:
+            print(f"ℹ️ {self.account_name}: 使用临时目录：{tmp_dir}")
+            async with AsyncCamoufox(
+                persistent_context=True,
+                user_data_dir=tmp_dir,
+                headless=False,
+                humanize=True,
+                locale="en-US",
+                geoip=True if self.camoufox_proxy_config else False,
+                proxy=self.camoufox_proxy_config,
+                os="macos",
+            ) as browser:
+                page = await browser.new_page()
+
+                try:
+                    await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
+
+                    try:
+                        await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+                    except Exception:
+                        await page.wait_for_timeout(3000)
+
+                    # 等待 Turnstile 组件自动出 token（最多 60s）
+                    try:
+                        await page.wait_for_function(
+                            """() => {
+                                const el = document.querySelector('[name="cf-turnstile-response"]');
+                                if (el && el.value) return true;
+                                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                                    return !!window.turnstile.getResponse();
+                                }
+                                return false;
+                            }""",
+                            timeout=60000,
+                        )
+                        token = await page.evaluate(
+                            """() => {
+                                const el = document.querySelector('[name="cf-turnstile-response"]');
+                                if (el && el.value) return el.value;
+                                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                                    try { return window.turnstile.getResponse() || null; } catch (e) { return null; }
+                                }
+                                return null;
+                            }"""
+                        )
+                    except Exception:
+                        token = None
+
+                    if token:
+                        print(f"✅ {self.account_name}: 已获取 Turnstile token")
+                        return token
+
+                    print(f"❌ {self.account_name}: 未能在登录页获取 Turnstile token")
+                    await take_screenshot(page, "turnstile_token_missing", self.account_name)
+                    return None
+
+                except Exception as e:
+                    print(f"❌ {self.account_name}: 获取 Turnstile token 时发生错误：{e}")
+                    return None
+                finally:
+                    await page.close()
 
     async def get_status_with_browser(self) -> dict | None:
         """使用 Camoufox 获取状态信息并缓存
@@ -1129,7 +1141,7 @@ class CheckIn:
             user_agent = common_headers.get("User-Agent", "")
             impersonate = get_curl_cffi_impersonate(user_agent) if user_agent else "firefox135"
         
-        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=30)
+        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=60, verify=False)
         if impersonate:
             print(f"ℹ️ {self.account_name}: 使用 curl_cffi Session，impersonate={impersonate}")
         
@@ -1234,7 +1246,7 @@ class CheckIn:
         user_agent = common_headers.get("User-Agent", "")
         impersonate = get_curl_cffi_impersonate(user_agent) if user_agent else "firefox135"
         
-        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=30)
+        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=60, verify=False)
         if impersonate:
             print(f"ℹ️ {self.account_name}: 使用 curl_cffi Session，impersonate={impersonate}")
         
@@ -1338,7 +1350,7 @@ class CheckIn:
         user_agent = common_headers.get("User-Agent", "")
         impersonate = get_curl_cffi_impersonate(user_agent)
         
-        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=30)
+        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=60, verify=False)
         if impersonate:
             print(f"ℹ️ {self.account_name}: 使用 curl_cffi Session，impersonate={impersonate}")
         
@@ -1544,7 +1556,7 @@ class CheckIn:
         user_agent = common_headers.get("User-Agent", "")
         impersonate = get_curl_cffi_impersonate(user_agent)
         
-        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=30)
+        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=60, verify=False)
         if impersonate:
             print(f"ℹ️ {self.account_name}: 使用 curl_cffi Session，impersonate={impersonate}")
         
@@ -1810,7 +1822,7 @@ class CheckIn:
         user_agent = common_headers.get("User-Agent", "")
         impersonate = get_curl_cffi_impersonate(user_agent)
 
-        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=30)
+        session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=60, verify=False)
         if impersonate:
             print(f"ℹ️ {self.account_name}: 使用 curl_cffi Session，impersonate={impersonate}")
 
@@ -1826,7 +1838,7 @@ class CheckIn:
 
             login_url = f"{self.provider_config.origin}/api/user/login?turnstile="
             payload = {"username": username, "password": password}
-            response = session.post(login_url, headers=headers, json=payload, timeout=30)
+            response = session.post(login_url, headers=headers, json=payload, timeout=60)
 
             if response.status_code != 200:
                 print(f"❌ {self.account_name}: 站点登录失败 - HTTP {response.status_code}")
@@ -1838,10 +1850,23 @@ class CheckIn:
                 cookies = await self.ensure_aliyun_bypass_cookies("站点登录接口返回 HTML（疑似阿里云 WAF 拦截）")
                 if cookies:
                     session.cookies.update(cookies)
-                    response = session.post(login_url, headers=headers, json=payload, timeout=30)
+                    response = session.post(login_url, headers=headers, json=payload, timeout=60)
                     json_data = response_resolve(response, "site_login_retry", self.account_name)
             if json_data is None:
                 return False, {"error": "站点登录返回无效响应"}
+
+            # 部分站点（如 hcnsec）登录接口要求 Cloudflare Turnstile token，
+            # 用浏览器打开登录页让组件自动通过后带 token 重试
+            if not json_data.get("success") and "turnstile" in str(json_data.get("message", "")).lower():
+                print(f"⚠️ {self.account_name}: 站点要求 Turnstile token，启动浏览器获取")
+                token = await self.get_turnstile_token_with_browser()
+                if token:
+                    login_url = f"{self.provider_config.origin}/api/user/login?turnstile={token}"
+                    response = session.post(login_url, headers=headers, json=payload, timeout=60)
+                    if response.status_code == 200:
+                        retry_data = response_resolve(response, "site_login_turnstile_retry", self.account_name)
+                        if retry_data is not None:
+                            json_data = retry_data
 
             if not json_data.get("success"):
                 error_msg = json_data.get("message", "站点登录失败")
@@ -2104,7 +2129,7 @@ class CheckIn:
         try:
             user_agent = common_headers.get("User-Agent", "")
             impersonate = get_curl_cffi_impersonate(user_agent)
-            session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=30)
+            session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=60, verify=False)
             session.cookies.update(cookies)
 
             headers = common_headers.copy()
