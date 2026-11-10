@@ -446,55 +446,73 @@ class CheckIn:
 
                     # 交互式 Turnstile（"Verify you are human" 复选框）不会自动通过：
                     # widget 的 iframe 在 shadow DOM 里（page.content 查不到 iframe 元素），
-                    # 需要通过 Frame 实体拿 frame_element() 按坐标点复选框
+                    # 用 Frame 内相对坐标点击（page.mouse 按视口坐标在上一轮实测落空）
                     if not token:
                         try:
                             frame_urls = [f.url for f in page.frames if f.url != page.url]
                             print(f"ℹ️ {self.account_name}: 当前页面 frames: {frame_urls}")
-                            clicked = False
-                            for frame in page.frames:
-                                if "challenges.cloudflare.com" not in (frame.url or ""):
-                                    continue
+
+                            async def _click_checkbox(cf_frame) -> bool:
+                                # 首选：iframe 内 body 相对坐标（复选框在左侧约 (28, 高度/2)）
                                 try:
-                                    frame_el = await frame.frame_element()
+                                    await cf_frame.locator("body").click(
+                                        position={"x": 28, "y": 32}, timeout=5000
+                                    )
+                                    return True
+                                except Exception as inner_err:
+                                    print(
+                                        f"⚠️ {self.account_name}: iframe 内坐标点击失败: {inner_err}"
+                                    )
+                                # 兜底：frame_element 视口坐标
+                                try:
+                                    frame_el = await cf_frame.frame_element()
                                     box = await frame_el.bounding_box()
+                                    if box:
+                                        await page.mouse.click(
+                                            box["x"] + 28, box["y"] + box["height"] / 2
+                                        )
+                                        return True
                                 except Exception as fe_err:
-                                    print(f"⚠️ {self.account_name}: 获取 Turnstile iframe 位置失败: {fe_err}")
-                                    continue
-                                if not box:
-                                    continue
-                                # Turnstile 复选框在 iframe 内左侧约 25-30px、垂直居中处
-                                print(
-                                    f"ℹ️ {self.account_name}: 按 Turnstile iframe 坐标点击复选框 "
-                                    f"(iframe 位置: {box})"
-                                )
-                                await page.mouse.click(
-                                    box["x"] + 28,
-                                    box["y"] + box["height"] / 2,
-                                )
-                                clicked = True
-                                break
-                            if not clicked:
-                                print(f"⚠️ {self.account_name}: 未找到 Turnstile 复选框或 iframe")
-                                await save_page_content_to_file(
-                                    page, "turnstile_widget_not_found", self.account_name
-                                )
+                                    print(
+                                        f"⚠️ {self.account_name}: 获取 Turnstile iframe 位置失败: {fe_err}"
+                                    )
+                                return False
+
+                            clicked = False
+                            for attempt in range(3):
+                                for frame in page.frames:
+                                    if "challenges.cloudflare.com" not in (frame.url or ""):
+                                        continue
+                                    print(
+                                        f"ℹ️ {self.account_name}: 点击 Turnstile 复选框"
+                                        f"（第 {attempt + 1}/3 次）"
+                                    )
+                                    clicked = await _click_checkbox(frame)
+                                    break
+                                if not clicked:
+                                    print(f"⚠️ {self.account_name}: 未找到 Turnstile iframe")
+                                    await save_page_content_to_file(
+                                        page, "turnstile_widget_not_found", self.account_name
+                                    )
+                                    break
+                                # 点击后等 token 生成（最多 25s），未生成则重试点击
+                                try:
+                                    await page.wait_for_function(
+                                        """() => {
+                                            const el = document.querySelector('[name="cf-turnstile-response"]');
+                                            return !!(el && el.value);
+                                        }""",
+                                        timeout=25000,
+                                    )
+                                    token = await _read_turnstile_token()
+                                except Exception:
+                                    token = await _read_turnstile_token()
+                                if token:
+                                    break
+                                print(f"⚠️ {self.account_name}: 点击后 token 未生成，重试")
+                                await page.wait_for_timeout(3000)
                         except Exception as click_err:
                             print(f"⚠️ {self.account_name}: 点击 Turnstile 复选框失败: {click_err}")
-
-                        # 点击后等 token 生成（最多 30s）
-                        if token is None:
-                            try:
-                                await page.wait_for_function(
-                                    """() => {
-                                        const el = document.querySelector('[name="cf-turnstile-response"]');
-                                        return !!(el && el.value);
-                                    }""",
-                                    timeout=30000,
-                                )
-                                token = await _read_turnstile_token()
-                            except Exception:
-                                token = await _read_turnstile_token()
 
                     if token:
                         print(f"✅ {self.account_name}: 已获取 Turnstile token")

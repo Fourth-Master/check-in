@@ -291,22 +291,43 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
                         handle.get("x") + handle.get("width") / 2,
                         handle.get("y") + handle.get("height") / 2,
                     )
+                    # 人手到位后会有短暂停顿再按下
+                    await page.wait_for_timeout(random.randint(120, 400))
                     await page.mouse.down()
-                    # 拟人轨迹：先快后慢、带纵向抖动，避免被判定为脚本直线拖动
+                    # 拟人轨迹：先快后慢、带纵向抖动、末端过冲后回拉，
+                    # 松手前停顿——规避风控对匀速直线的判定
                     start_x = handle.get("x") + handle.get("width") / 2
                     # 拖到轨道右端（减去手柄半宽，确保手柄完全滑到底）
                     end_x = slider.get("x") + slider.get("width") - handle.get("width") / 2
                     y = handle.get("y") + handle.get("height") / 2
                     distance = end_x - start_x
-                    steps = random.randint(25, 40)
+                    steps = random.randint(30, 50)
+                    overshoot = random.uniform(8, 20)
 
                     for i in range(1, steps + 1):
                         progress = i / steps
-                        # ease-out：前半段快、后半段慢
-                        eased = 1 - (1 - progress) ** 2
-                        jitter_y = random.uniform(-2, 2) * math.sin(progress * math.pi)
-                        await page.mouse.move(start_x + distance * eased, y + jitter_y)
-                        await page.wait_for_timeout(random.randint(8, 25))
+                        # ease-in-out：起步慢、中段快、收尾慢
+                        eased = (
+                            2 * progress**2
+                            if progress < 0.5
+                            else 1 - (-2 * progress + 2) ** 2 / 2
+                        )
+                        jitter_y = random.uniform(-3, 3) * math.sin(progress * math.pi)
+                        await page.mouse.move(
+                            start_x + (distance + overshoot) * eased, y + jitter_y
+                        )
+                        await page.wait_for_timeout(random.randint(5, 20))
+                    # 过冲后回拉到终点
+                    pullback_steps = random.randint(3, 6)
+                    for i in range(1, pullback_steps + 1):
+                        progress = i / pullback_steps
+                        await page.mouse.move(
+                            start_x + distance + overshoot * (1 - progress),
+                            y + random.uniform(-1, 1),
+                        )
+                        await page.wait_for_timeout(random.randint(10, 30))
+                    # 松手前停顿（人手松开前的犹豫）
+                    await page.wait_for_timeout(random.randint(80, 300))
                     await page.mouse.up()
                     await take_screenshot(page, "aliyun_captcha_slider_completed", account_name)
 
