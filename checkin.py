@@ -260,7 +260,8 @@ class CheckIn:
         （自动滑块）。
         """
         print(
-            f"ℹ️ {self.account_name}: 启动浏览器获取阿里云验证码 Cookie (使用代理: {'true' if self.camoufox_proxy_config else 'false'})"
+            f"ℹ️ {self.account_name}: 启动浏览器获取阿里云验证码 Cookie "
+            f"(使用代理: {'true' if self._waf_browser_proxy() else 'false'})"
         )
 
         with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_aliyun_captcha_") as tmp_dir:
@@ -380,6 +381,25 @@ class CheckIn:
             self._bypass_cookies.update(self._aliyun_captcha_cookies)
         return self._aliyun_captcha_cookies
 
+    def _waf_browser_proxy(self) -> dict | None:
+        """WAF 验证浏览器的代理配置
+
+        阿里云 WAF / Cloudflare Turnstile 对数据中心 IP（GitHub runner）
+        风控极严：滑块拖动正常仍会被服务端拒绝（"Verification failed"）。
+        账号未启用代理时回退到全局 PROXY（v2ray 本地代理），并同步更新
+        HTTP 层代理，保证浏览器与后续 API 请求同源出口 IP——
+        否则 IP 绑定的 WAF Cookie / Turnstile token 会校验失败。
+        """
+        if self.camoufox_proxy_config:
+            return self.camoufox_proxy_config
+        env_proxy = os.getenv("PROXY", "").strip()
+        if env_proxy:
+            print(f"ℹ️ {self.account_name}: 账号未启用代理，WAF 验证回退使用全局 PROXY")
+            self.camoufox_proxy_config = {"server": env_proxy}
+            self.http_proxy_config = env_proxy
+            return self.camoufox_proxy_config
+        return None
+
     async def get_turnstile_token_with_browser(self) -> str | None:
         """使用 Camoufox 打开登录页，等待 Cloudflare Turnstile 组件自动完成并提取 token
 
@@ -390,7 +410,7 @@ class CheckIn:
         """
         print(
             f"ℹ️ {self.account_name}: 启动浏览器获取 Turnstile token "
-            f"(使用代理: {'true' if self.camoufox_proxy_config else 'false'})"
+            f"(使用代理: {'true' if self._waf_browser_proxy() else 'false'})"
         )
 
         with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_turnstile_") as tmp_dir:
@@ -409,6 +429,30 @@ class CheckIn:
 
                 try:
                     await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
+
+                    # SPA 站点（如莱斯超级API）：React 挂载前 #root 为空、
+                    # Turnstile 组件根本不存在，先等组件渲染出来再取 token
+                    try:
+                        await page.wait_for_selector(
+                            ".cf-turnstile, iframe[title*='Cloudflare'], "
+                            "[name='cf-turnstile-response'], .g-recaptcha",
+                            state="attached",
+                            timeout=30000,
+                        )
+                    except Exception:
+                        print(f"⚠️ {self.account_name}: 登录页未见 Turnstile 组件，尝试刷新一次")
+                        await page.reload(wait_until="networkidle")
+                        try:
+                            await page.wait_for_selector(
+                                ".cf-turnstile, iframe[title*='Cloudflare'], "
+                                "[name='cf-turnstile-response'], .g-recaptcha",
+                                state="attached",
+                                timeout=30000,
+                            )
+                        except Exception:
+                            await save_page_content_to_file(
+                                page, "turnstile_widget_not_rendered", self.account_name
+                            )
 
                     try:
                         await page.wait_for_function('document.readyState === "complete"', timeout=5000)
@@ -483,9 +527,22 @@ class CheckIn:
                                 for frame in page.frames:
                                     if "challenges.cloudflare.com" not in (frame.url or ""):
                                         continue
+                                    # 多个 cf frame 时优先点可见 widget（约 300x65）：
+                                    # 隐藏的预清理 frame 点了也无效
+                                    try:
+                                        frame_el = await frame.frame_element()
+                                        fbox = await frame_el.bounding_box()
+                                    except Exception:
+                                        fbox = None
+                                    if fbox and not (150 <= fbox["width"] <= 500 and 30 <= fbox["height"] <= 120):
+                                        print(
+                                            f"⚠️ {self.account_name}: 跳过异常尺寸的 Turnstile frame "
+                                            f"({fbox['width']:.0f}x{fbox['height']:.0f})"
+                                        )
+                                        continue
                                     print(
                                         f"ℹ️ {self.account_name}: 点击 Turnstile 复选框"
-                                        f"（第 {attempt + 1}/3 次）"
+                                        f"（第 {attempt + 1}/3 次，frame {fbox}）"
                                     )
                                     clicked = await _click_checkbox(frame)
                                     break
