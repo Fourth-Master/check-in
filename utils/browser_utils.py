@@ -235,8 +235,9 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
                 slider_element = await page.query_selector("#nocaptcha .nc_scale")
                 slider_handle = await page.query_selector("#nocaptcha .btn_slide")
                 if slider_handle is None:
-                    # 新版：等待滑块手柄出现。实测 AliyunCaptcha.js 在 Actions runner
-                    # 上加载+渲染可能超过 1 分钟，等待时间放宽到 150s
+                    # 新版：等待滑块手柄出现。实测 AliyunCaptcha.js 渲染很慢且元素
+                    # 可能长时间处于零尺寸布局（visible 判定不通过但 DOM 已挂载），
+                    # 因此用 state="attached" + 轮询 bounding_box
                     print(f"ℹ️ {account_name}: 等待阿里云滑块组件渲染（最长 150s）...")
                     try:
                         await page.wait_for_selector(
@@ -245,18 +246,25 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
                             "#captcha-element [class*='slide'], "
                             "#nocaptcha .btn_slide",
                             timeout=150000,
+                            state="attached",
                         )
                     except Exception:
                         await save_page_content_to_file(
                             page, "aliyun_captcha_no_slider", account_name
                         )
                         raise
-                    slider_handle = (
-                        await page.query_selector("#aliyunCaptcha-sliding-slider")
-                        or await page.query_selector("#captcha-element .aliyun_captcha_slide_button")
-                        or await page.query_selector("#captcha-element [class*='slide']")
-                        or await page.query_selector("#nocaptcha .btn_slide")
-                    )
+                    for _ in range(30):
+                        slider_handle = (
+                            await page.query_selector("#aliyunCaptcha-sliding-slider")
+                            or await page.query_selector("#captcha-element .aliyun_captcha_slide_button")
+                            or await page.query_selector("#captcha-element [class*='slide']")
+                            or await page.query_selector("#nocaptcha .btn_slide")
+                        )
+                        if slider_handle:
+                            handle_box = await slider_handle.bounding_box()
+                            if handle_box and handle_box.get("width", 0) > 5 and handle_box.get("height", 0) > 5:
+                                break
+                        await page.wait_for_timeout(1000)
 
                 if slider_element is None and slider_handle is not None:
                     # 新版没有 .nc_scale 轨道：用滑块手柄的父元素作为轨道
