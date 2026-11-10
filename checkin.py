@@ -15,7 +15,14 @@ from urllib.parse import urlparse, urlencode
 from curl_cffi import requests as curl_requests
 from camoufox.async_api import AsyncCamoufox
 from utils.config import AccountConfig, ProviderConfig
-from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
+from utils.browser_utils import (
+    parse_cookies,
+    filter_cookies,
+    get_random_user_agent,
+    take_screenshot,
+    aliyun_captcha_check,
+    save_page_content_to_file,
+)
 from utils.get_cf_clearance import get_cf_clearance
 from utils.http_utils import proxy_resolve, response_resolve, resolve_account_proxy
 from utils.topup import topup
@@ -441,21 +448,46 @@ class CheckIn:
                     # token 未出现时到 challenges.cloudflare.com iframe 里点复选框
                     if not token:
                         try:
+                            frame_urls = [f.url for f in page.frames if f.url != page.url]
+                            print(f"ℹ️ {self.account_name}: 当前页面 frames: {frame_urls}")
+                            clicked = False
                             for frame in page.frames:
                                 if "challenges.cloudflare.com" in (frame.url or ""):
-                                    checkbox = frame.locator('input[type="checkbox"]')
+                                    checkbox = frame.locator(
+                                        'input[type="checkbox"], .ctp-checkbox-label, [class*="checkbox"]'
+                                    )
                                     if await checkbox.count() > 0:
-                                        print(f"ℹ️ {self.account_name}: 点击 Turnstile 复选框")
+                                        print(f"ℹ️ {self.account_name}: 在 Turnstile iframe 内点击复选框")
                                         await checkbox.first.click(timeout=8000)
+                                        clicked = True
                                         break
-                            else:
-                                # 兜底：按 widget iframe 的位置点复选框（左侧约 30px 处）
-                                widget = await page.query_selector('iframe[src*="challenges.cloudflare.com"]')
-                                if widget:
+                            if not clicked:
+                                # 兜底：Turnstile widget 是 challenges.cloudflare.com 的 iframe，
+                                # 复选框在其内部左侧约 30px 处，直接按坐标点击
+                                widget = await page.query_selector(
+                                    'iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"], '
+                                    'iframe[allow*="cross-origin-isolation"]'
+                                )
+                                if widget is None:
+                                    # widget 可能在 .cf-turnstile 容器内，用容器位置点击
+                                    widget = await page.query_selector('.cf-turnstile, [class*="turnstile"]')
+                                    if widget:
+                                        box = await widget.bounding_box()
+                                        if box:
+                                            print(f"ℹ️ {self.account_name}: 按 Turnstile 容器坐标点击复选框")
+                                            await page.mouse.click(box["x"] + 30, box["y"] + 25)
+                                            clicked = True
+                                if widget and not clicked:
                                     box = await widget.bounding_box()
                                     if box:
-                                        print(f"ℹ️ {self.account_name}: 按 iframe 坐标点击 Turnstile 复选框")
+                                        print(f"ℹ️ {self.account_name}: 按 Turnstile iframe 坐标点击复选框")
                                         await page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                                        clicked = True
+                            if not clicked:
+                                print(f"⚠️ {self.account_name}: 未找到 Turnstile 复选框或 iframe")
+                                await save_page_content_to_file(
+                                    page, "turnstile_widget_not_found", self.account_name
+                                )
                         except Exception as click_err:
                             print(f"⚠️ {self.account_name}: 点击 Turnstile 复选框失败: {click_err}")
 
