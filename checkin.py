@@ -409,6 +409,18 @@ class CheckIn:
                         await page.wait_for_timeout(3000)
 
                     # 等待 Turnstile 组件自动出 token（最多 60s）
+                    async def _read_turnstile_token() -> str | None:
+                        return await page.evaluate(
+                            """() => {
+                                const el = document.querySelector('[name="cf-turnstile-response"]');
+                                if (el && el.value) return el.value;
+                                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                                    try { return window.turnstile.getResponse() || null; } catch (e) { return null; }
+                                }
+                                return null;
+                            }"""
+                        )
+
                     try:
                         await page.wait_for_function(
                             """() => {
@@ -421,18 +433,45 @@ class CheckIn:
                             }""",
                             timeout=60000,
                         )
-                        token = await page.evaluate(
-                            """() => {
-                                const el = document.querySelector('[name="cf-turnstile-response"]');
-                                if (el && el.value) return el.value;
-                                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
-                                    try { return window.turnstile.getResponse() || null; } catch (e) { return null; }
-                                }
-                                return null;
-                            }"""
-                        )
+                        token = await _read_turnstile_token()
                     except Exception:
                         token = None
+
+                    # 交互式 Turnstile（"Verify you are human" 复选框）不会自动通过：
+                    # token 未出现时到 challenges.cloudflare.com iframe 里点复选框
+                    if not token:
+                        try:
+                            for frame in page.frames:
+                                if "challenges.cloudflare.com" in (frame.url or ""):
+                                    checkbox = frame.locator('input[type="checkbox"]')
+                                    if await checkbox.count() > 0:
+                                        print(f"ℹ️ {self.account_name}: 点击 Turnstile 复选框")
+                                        await checkbox.first.click(timeout=8000)
+                                        break
+                            else:
+                                # 兜底：按 widget iframe 的位置点复选框（左侧约 30px 处）
+                                widget = await page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+                                if widget:
+                                    box = await widget.bounding_box()
+                                    if box:
+                                        print(f"ℹ️ {self.account_name}: 按 iframe 坐标点击 Turnstile 复选框")
+                                        await page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                        except Exception as click_err:
+                            print(f"⚠️ {self.account_name}: 点击 Turnstile 复选框失败: {click_err}")
+
+                        # 点击后等 token 生成（最多 30s）
+                        if token is None:
+                            try:
+                                await page.wait_for_function(
+                                    """() => {
+                                        const el = document.querySelector('[name="cf-turnstile-response"]');
+                                        return !!(el && el.value);
+                                    }""",
+                                    timeout=30000,
+                                )
+                                token = await _read_turnstile_token()
+                            except Exception:
+                                token = await _read_turnstile_token()
 
                     if token:
                         print(f"✅ {self.account_name}: 已获取 Turnstile token")

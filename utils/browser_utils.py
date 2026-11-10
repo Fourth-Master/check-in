@@ -228,14 +228,37 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
         if traceid:
             print(f"⚠️ {account_name}: 检测到阿里云验证码，traceid: {traceid}")
             try:
-                await page.wait_for_selector("#nocaptcha", timeout=60000)
-
+                # 兼容两代阿里云验证码：
+                # 1.0 旧版：#nocaptcha 内 .nc_scale 轨道 + .btn_slide 手柄
+                # 2.0 新版（AliyunCaptcha.js）：#captcha-element 容器内
+                #     #aliyunCaptcha-sliding-slider 手柄（embed 模式直接渲染滑块）
                 slider_element = await page.query_selector("#nocaptcha .nc_scale")
+                slider_handle = await page.query_selector("#nocaptcha .btn_slide")
+                if slider_handle is None:
+                    # 新版：等待滑块手柄出现
+                    await page.wait_for_selector(
+                        "#aliyunCaptcha-sliding-slider, #captcha-element .aliyun_captcha_slide_button, "
+                        "#captcha-element [class*='slide'] ",
+                        timeout=60000,
+                    )
+                    slider_handle = await page.query_selector("#aliyunCaptcha-sliding-slider") or (
+                        await page.query_selector("#captcha-element [class*='slide']")
+                    )
+
+                if slider_element is None and slider_handle is not None:
+                    # 新版没有 .nc_scale 轨道：用滑块手柄的父元素作为轨道
+                    try:
+                        parent_el = await slider_handle.evaluate_handle("el => el.parentElement")
+                        parent_elem = parent_el.as_element() if parent_el else None
+                        if parent_elem:
+                            slider_element = parent_elem
+                    except Exception:
+                        pass
+
                 slider = await slider_element.bounding_box() if slider_element else None
                 if slider:
                     print(f"ℹ️ {account_name}: 滑块边界框: {slider}")
 
-                slider_handle = await page.query_selector("#nocaptcha .btn_slide")
                 handle = await slider_handle.bounding_box() if slider_handle else None
                 if handle:
                     print(f"ℹ️ {account_name}: 滑块手柄边界框: {handle}")
@@ -250,7 +273,8 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
                     await page.mouse.down()
                     # 拟人轨迹：先快后慢、带纵向抖动，避免被判定为脚本直线拖动
                     start_x = handle.get("x") + handle.get("width") / 2
-                    end_x = handle.get("x") + slider.get("width")
+                    # 拖到轨道右端（减去手柄半宽，确保手柄完全滑到底）
+                    end_x = slider.get("x") + slider.get("width") - handle.get("width") / 2
                     y = handle.get("y") + handle.get("height") / 2
                     distance = end_x - start_x
                     steps = random.randint(25, 40)
