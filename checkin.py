@@ -829,6 +829,14 @@ class CheckIn:
                             )
                             json_data = response_resolve(response, "get_auth_state_retry", self.account_name)
                 if json_data is None:
+                    # 浏览器会话能通过 WAF（真实 TLS 指纹），改在浏览器里
+                    # 直接 fetch 授权状态接口（顺带拿到完整 Cookie 供后续用）
+                    print(f"ℹ️ {self.account_name}: WAF Cookie 重试仍被拦截，改用浏览器获取授权状态")
+                    browser_result = await self.get_auth_state_with_browser()
+                    if browser_result.get("success"):
+                        return browser_result
+
+                if json_data is None:
                     return {
                         "success": False,
                         "error": "获取授权状态失败：响应类型无效 (已保存到日志)",
