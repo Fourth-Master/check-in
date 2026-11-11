@@ -764,9 +764,21 @@ class CheckIn:
                     response = await page.evaluate(
                         f"""async () => {{
                             try{{
-                                const response = await fetch('{self.provider_config.get_auth_state_url()}');
-                                const data = await response.json();
-                                return data;
+                                const response = await fetch('{self.provider_config.get_auth_state_url()}', {{
+                                    headers: {{ 'Accept': 'application/json' }},
+                                    credentials: 'include'
+                                }});
+                                const text = await response.text();
+                                try {{
+                                    return JSON.parse(text);
+                                }} catch (parse_err) {{
+                                    return {{
+                                        success: false,
+                                        message: 'non-JSON response',
+                                        status: response.status,
+                                        body: text.slice(0, 300)
+                                    }};
+                                }}
                             }}catch(e){{
                                 return {{
                                     success: false,
@@ -775,6 +787,7 @@ class CheckIn:
                             }}
                         }}"""
                     )
+                    print(f"ℹ️ {self.account_name}: 浏览器内 fetch 授权状态结果: {str(response)[:300]}")
 
                     if response and "data" in response:
                         cookies = await browser.cookies()
@@ -835,6 +848,7 @@ class CheckIn:
                     browser_result = await self.get_auth_state_with_browser()
                     if browser_result.get("success"):
                         return browser_result
+                    print(f"⚠️ {self.account_name}: 浏览器获取授权状态也失败: {browser_result.get('error')}")
 
                 if json_data is None:
                     return {
